@@ -1,0 +1,26 @@
+# Running Raygun
+
+Raygun exposes the same HTTP interface as the Spatie Ray desktop app. The
+binary bundles an HTTP server and terminal UI in a single process.
+
+```bash
+cargo run -- --bind 0.0.0.0:23517
+```
+
+## Bind Address
+
+- `--bind <addr>` (defaults to `127.0.0.1:23517`)
+- Environment alternative: `RAYGUN_BIND=0.0.0.0:23517`
+
+Use the address you configure in your PHP project's Ray settings. Once the app
+is running, invoke the usual `ray()` helper and payloads will appear in the
+timeline list.
+
+## Development Tips
+
+1. Keep one terminal per workspace: one for `cargo watch -x 'run -- --bind …'`
+   and another to run unit tests.
+2. Navigate the timeline with `↑/↓` or `j/k`; `PgUp/PgDn` jump 10 entries. The
+   details pane follows the highlighted row. Quit with `q`, `Esc`, or `Ctrl+C`.
+3. If the port is already in use, Raygun fails to bind; choose another port via
+   `--bind 127.0.0.1:23518` while testing.

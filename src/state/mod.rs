@@ -1,0 +1,402 @@
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::Arc,
+    time::SystemTime,
+};
+
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::protocol::{PayloadKind, RayRequest};
+
+const DEFAULT_RETENTION: usize = 1_024;
+
+#[derive(Debug, Clone)]
+pub struct TimelineEvent {
+    pub id: Uuid,
+    pub received_at: SystemTime,
+    pub request: Arc<RayRequest>,
+    pub screen: Option<String>,
+}
+
+impl TimelineEvent {
+    pub fn new(request: RayRequest, screen: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            received_at: SystemTime::now(),
+            request: Arc::new(request),
+            screen,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LockRecord {
+    pub hostname: Option<String>,
+    pub project_name: Option<String>,
+}
+
+impl LockRecord {
+    fn new(hostname: Option<String>, project_name: Option<String>) -> Self {
+        Self {
+            hostname,
+            project_name,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AppState {
+    retention: usize,
+    inner: RwLock<StateInner>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new(DEFAULT_RETENTION)
+    }
+}
+
+impl AppState {
+    pub fn new(retention: usize) -> Self {
+        Self {
+            retention,
+            inner: RwLock::new(StateInner::default()),
+        }
+    }
+
+    pub async fn record_request(&self, request: RayRequest) -> Option<TimelineEvent> {
+        let screen_hint = extract_screen_from_meta(&request.meta);
+        let mut event = TimelineEvent::new(request, screen_hint);
+
+        let mut inner = self.inner.write().await;
+        let outcome = inner.apply_payloads(&mut event);
+
+        if matches!(outcome, ApplyOutcome::Skip) {
+            return None;
+        }
+
+        if event.screen.is_none() {
+            event.screen = inner.current_screen.clone();
+        }
+
+        let stored_event = event.clone();
+        inner.timeline.push_back(stored_event.clone());
+        if inner.timeline.len() > self.retention {
+            inner.timeline.pop_front();
+        }
+
+        Some(stored_event)
+    }
+
+    pub async fn timeline_snapshot(&self) -> Vec<TimelineEvent> {
+        let inner = self.inner.read().await;
+        inner.timeline.iter().cloned().collect()
+    }
+
+    pub async fn timeline_len(&self) -> usize {
+        let inner = self.inner.read().await;
+        inner.timeline.len()
+    }
+
+    pub async fn lock_exists(
+        &self,
+        name: &str,
+        hostname: Option<&str>,
+        project: Option<&str>,
+    ) -> bool {
+        let inner = self.inner.read().await;
+        inner
+            .locks
+            .get(name)
+            .map(|record| {
+                hostname.map_or(true, |expected| {
+                    record.hostname.as_deref() == Some(expected)
+                }) && project.map_or(true, |expected| {
+                    record.project_name.as_deref() == Some(expected)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    pub async fn clear_lock(&self, name: &str) {
+        let mut inner = self.inner.write().await;
+        inner.locks.remove(name);
+    }
+}
+
+#[derive(Debug, Default)]
+struct StateInner {
+    timeline: VecDeque<TimelineEvent>,
+    locks: HashMap<String, LockRecord>,
+    current_screen: Option<String>,
+}
+
+impl StateInner {
+    fn apply_payloads(&mut self, event: &mut TimelineEvent) -> ApplyOutcome {
+        let mut displayable = false;
+        let mut outcome = ApplyOutcome::Record;
+
+        for payload in &event.request.payloads {
+            match &payload.kind {
+                PayloadKind::CreateLock => {
+                    if let Some(name) = payload.content_string("name") {
+                        let hostname = event
+                            .request
+                            .meta
+                            .get("hostname")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned);
+                        let project = event
+                            .request
+                            .meta
+                            .get("project_name")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned);
+                        self.locks
+                            .insert(name.to_owned(), LockRecord::new(hostname, project));
+                    }
+                }
+                PayloadKind::ClearAll => {
+                    self.timeline.clear();
+                    self.locks.clear();
+                    self.current_screen = None;
+                    outcome = ApplyOutcome::Skip;
+                }
+                PayloadKind::Remove => {
+                    if let Some(name) = payload.content_string("name") {
+                        self.locks.remove(name);
+                    }
+                    self.timeline.pop_back();
+                    outcome = ApplyOutcome::Skip;
+                }
+                PayloadKind::Hide => {
+                    self.timeline.pop_back();
+                    outcome = ApplyOutcome::Skip;
+                }
+                PayloadKind::NewScreen => {
+                    if let Some(name) = payload.content_string("name") {
+                        let sanitized = sanitize_screen_name(name);
+                        self.current_screen = Some(sanitized.clone());
+                        event.screen = Some(sanitized);
+                    }
+                    displayable = true;
+                }
+                _ => {}
+            }
+
+            if matches!(
+                payload.kind,
+                PayloadKind::Log
+                    | PayloadKind::Custom
+                    | PayloadKind::Text
+                    | PayloadKind::Notify
+                    | PayloadKind::Exception
+                    | PayloadKind::Trace
+                    | PayloadKind::Table
+                    | PayloadKind::Image
+                    | PayloadKind::JsonString
+                    | PayloadKind::DecodedJson
+                    | PayloadKind::Separator
+                    | PayloadKind::Measure
+                    | PayloadKind::PhpInfo
+                    | PayloadKind::Color
+                    | PayloadKind::Size
+                    | PayloadKind::Caller
+                    | PayloadKind::ShowBrowser
+                    | PayloadKind::ShowApp
+                    | PayloadKind::HideApp
+                    | PayloadKind::Ban
+                    | PayloadKind::Charles
+                    | PayloadKind::NewScreen
+            ) {
+                displayable = true;
+            }
+        }
+
+        if !displayable {
+            outcome = ApplyOutcome::Skip;
+        }
+
+        if event.screen.is_none() {
+            event.screen = self.current_screen.clone();
+        }
+
+        outcome
+    }
+}
+
+fn sanitize_screen_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty() {
+        "Screen".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn extract_screen_from_meta(meta: &BTreeMap<String, serde_json::Value>) -> Option<String> {
+    const KEYS: &[&str] = &["screen", "screen_name", "screenName"];
+    for key in KEYS {
+        if let Some(value) = meta.get(*key).and_then(|value| value.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    Record,
+    Skip,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Payload, RayRequest};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn make_payload(value: serde_json::Value) -> Payload {
+        serde_json::from_value(value).expect("payload should deserialize")
+    }
+
+    fn request_with_payload(payload: Payload) -> RayRequest {
+        RayRequest {
+            uuid: "test".into(),
+            payloads: vec![payload],
+            meta: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn records_timeline_with_retention() {
+        let state = AppState::new(2);
+
+        let payload = make_payload(json!({
+            "type": "log",
+            "content": { "values": ["a"], "meta": [] }
+        }));
+
+        assert!(
+            state
+                .record_request(request_with_payload(payload.clone()))
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .record_request(request_with_payload(payload.clone()))
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .record_request(request_with_payload(payload))
+                .await
+                .is_some()
+        );
+
+        let events = state.timeline_snapshot().await;
+        assert_eq!(events.len(), 2, "timeline should enforce retention");
+        assert_ne!(events[0].id, events[1].id);
+        for event in events {
+            assert!(event.received_at.elapsed().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn tracks_locks_from_payloads_without_recording_event() {
+        let state = AppState::default();
+
+        let payload = make_payload(json!({
+            "type": "create_lock",
+            "content": { "name": "pause-lock" }
+        }));
+
+        assert!(
+            state
+                .record_request(request_with_payload(payload))
+                .await
+                .is_none()
+        );
+
+        assert!(
+            state.lock_exists("pause-lock", None, None).await,
+            "lock should be registered"
+        );
+
+        state.clear_lock("pause-lock").await;
+        assert!(
+            !state.lock_exists("pause-lock", None, None).await,
+            "lock should be removed after clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_all_purges_timeline() {
+        let state = AppState::default();
+
+        let log = make_payload(json!({
+            "type": "log",
+            "content": { "values": ["hello"], "meta": [] }
+        }));
+
+        state
+            .record_request(request_with_payload(log))
+            .await
+            .expect("log should record");
+
+        let clear = make_payload(json!({
+            "type": "clear_all",
+            "content": {}
+        }));
+
+        assert!(
+            state
+                .record_request(request_with_payload(clear))
+                .await
+                .is_none()
+        );
+
+        let events = state.timeline_snapshot().await;
+        assert!(
+            events.is_empty(),
+            "timeline should be empty after clear_all"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_screen_updates_current_screen() {
+        let state = AppState::default();
+
+        let screen = make_payload(json!({
+            "type": "new_screen",
+            "content": { "name": "Debug" }
+        }));
+
+        state
+            .record_request(request_with_payload(screen))
+            .await
+            .expect("new screen should be recorded");
+
+        let log = make_payload(json!({
+            "type": "log",
+            "content": { "values": ["data"], "meta": [] }
+        }));
+
+        state
+            .record_request(request_with_payload(log))
+            .await
+            .expect("log should be recorded");
+
+        let events = state.timeline_snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].screen.as_deref(), Some("Debug"));
+        assert_eq!(events[1].screen.as_deref(), Some("Debug"));
+    }
+}

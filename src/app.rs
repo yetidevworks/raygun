@@ -1,0 +1,397 @@
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+use color_eyre::Result;
+use crossterm::event::{KeyCode, KeyModifiers};
+use html_escape::decode_html_entities;
+use serde_json::Value;
+use tokio::{select, sync::mpsc};
+use tracing::{debug, info, warn};
+
+use crate::{
+    config::Config,
+    protocol::{Payload, PayloadKind},
+    server,
+    state::{AppState, TimelineEvent},
+    tui::{self, AppViewModel, Event, TerminalGuard, TimelineEntry},
+    ui::detail::build_detail_view,
+};
+
+pub struct RaygunApp {
+    tick_rate: Duration,
+    state: Arc<AppState>,
+    server: Option<server::ServerHandle>,
+    server_addr: SocketAddr,
+    selected: Option<usize>,
+}
+
+const TIMELINE_VIEW_LIMIT: usize = 200;
+
+impl RaygunApp {
+    pub async fn bootstrap(config: Config) -> Result<Self> {
+        let state = Arc::new(AppState::default());
+        let server_config = server::ServerConfig {
+            bind_addr: config.bind_addr,
+        };
+        let server = server::spawn(Arc::clone(&state), server_config).await?;
+        let server_addr = server.addr();
+
+        info!(addr = %server_addr, "HTTP server ready");
+
+        Ok(Self {
+            tick_rate: Duration::from_millis(250),
+            state,
+            server: Some(server),
+            server_addr,
+            selected: None,
+        })
+    }
+
+    pub async fn run(mut self) -> Result<()> {
+        info!("starting Raygun placeholder UI");
+
+        let mut terminal = TerminalGuard::new()?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let event_handle = tui::spawn_event_loop(tx, self.tick_rate);
+
+        loop {
+            let view_model = self.build_view_model().await;
+            let timeline_len = view_model.timeline.len();
+
+            terminal.draw(|frame| tui::render_app(frame, &view_model))?;
+
+            let exit_requested = select! {
+                maybe_event = rx.recv() => {
+                    match maybe_event {
+                        Some(event) => self.handle_event(event, timeline_len),
+                        None => true,
+                    }
+                }
+                ctrl_c = tokio::signal::ctrl_c() => {
+                    if let Err(err) = ctrl_c {
+                        warn!(?err, "failed to listen for ctrl+c");
+                    } else {
+                        info!("received ctrl+c");
+                    }
+                    true
+                }
+            };
+
+            if exit_requested {
+                break;
+            }
+        }
+
+        drop(terminal);
+        drop(rx);
+
+        if let Err(err) = event_handle.await {
+            warn!(?err, "terminal event loop task ended unexpectedly");
+        }
+
+        if let Some(server) = self.server.take() {
+            server.shutdown().await?;
+        }
+
+        info!("Raygun shutting down");
+        Ok(())
+    }
+
+    async fn build_view_model(&mut self) -> AppViewModel {
+        let events = self.state.timeline_snapshot().await;
+        let mut ordered_events: Vec<_> = events.into_iter().rev().collect();
+        if ordered_events.len() > TIMELINE_VIEW_LIMIT {
+            ordered_events.truncate(TIMELINE_VIEW_LIMIT);
+        }
+
+        if ordered_events.is_empty() {
+            self.selected = None;
+        } else {
+            let max_index = ordered_events.len().saturating_sub(1);
+            self.selected = Some(self.selected.unwrap_or(0).min(max_index));
+        }
+
+        let timeline = ordered_events
+            .iter()
+            .map(|event| summarize_event(event))
+            .collect::<Vec<_>>();
+
+        let detail = self
+            .selected
+            .and_then(|index| ordered_events.get(index))
+            .and_then(|event| {
+                event
+                    .request
+                    .payloads
+                    .first()
+                    .map(|payload| (payload, event))
+            })
+            .map(|(payload, event)| build_detail_view(payload, event.received_at));
+
+        AppViewModel {
+            total_events: self.state.timeline_len().await,
+            bind_addr: self.server_addr,
+            timeline,
+            selected: self.selected,
+            detail,
+        }
+    }
+
+    fn handle_event(&mut self, event: Event, timeline_len: usize) -> bool {
+        match event {
+            Event::Input(key) => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => true,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_selection(1, timeline_len);
+                    false
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_selection(-1, timeline_len);
+                    false
+                }
+                KeyCode::PageDown => {
+                    self.move_selection(10, timeline_len);
+                    false
+                }
+                KeyCode::PageUp => {
+                    self.move_selection(-10, timeline_len);
+                    false
+                }
+                KeyCode::Home => {
+                    if timeline_len > 0 {
+                        self.selected = Some(0);
+                    }
+                    false
+                }
+                KeyCode::End => {
+                    if timeline_len > 0 {
+                        self.selected = Some(timeline_len.saturating_sub(1));
+                    }
+                    false
+                }
+                _ => false,
+            },
+            Event::Tick => false,
+            Event::Resize(width, height) => {
+                debug!(%width, %height, "terminal resized");
+                false
+            }
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32, len: usize) {
+        if len == 0 {
+            self.selected = None;
+            return;
+        }
+
+        let current = self.selected.unwrap_or(0) as i32;
+        let new_index = (current + delta).clamp(0, len.saturating_sub(1) as i32) as usize;
+        self.selected = Some(new_index);
+    }
+}
+
+fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
+    let elapsed = event.received_at.elapsed().unwrap_or_default();
+
+    if let Some(payload) = event.request.payloads.first() {
+        let kind = payload_kind_label(&payload.kind);
+        let mut summary = payload_summary(payload);
+
+        if let Some(screen) = event.screen.as_deref() {
+            summary = format!("{} | {}", screen, summary);
+        }
+
+        TimelineEntry {
+            kind,
+            summary,
+            age: format_elapsed(elapsed),
+        }
+    } else {
+        let mut summary = "Request without payloads".to_string();
+        if let Some(screen) = event.screen.as_deref() {
+            summary = format!("{} | {}", screen, summary);
+        }
+        TimelineEntry {
+            kind: "empty".to_string(),
+            summary,
+            age: format_elapsed(elapsed),
+        }
+    }
+}
+
+fn payload_kind_label(kind: &PayloadKind) -> String {
+    match kind {
+        PayloadKind::Log => "log",
+        PayloadKind::Custom => "custom",
+        PayloadKind::CreateLock => "create_lock",
+        PayloadKind::ClearAll => "clear_all",
+        PayloadKind::Hide => "hide",
+        PayloadKind::ShowApp => "show_app",
+        PayloadKind::ShowBrowser => "show_browser",
+        PayloadKind::Notify => "notify",
+        PayloadKind::Separator => "separator",
+        PayloadKind::Exception => "exception",
+        PayloadKind::Table => "table",
+        PayloadKind::Text => "text",
+        PayloadKind::Image => "image",
+        PayloadKind::JsonString => "json_string",
+        PayloadKind::DecodedJson => "decoded_json",
+        PayloadKind::Boolean => "boolean",
+        PayloadKind::Size => "size",
+        PayloadKind::Color => "color",
+        PayloadKind::Trace => "trace",
+        PayloadKind::Caller => "caller",
+        PayloadKind::Measure => "measure",
+        PayloadKind::PhpInfo => "phpinfo",
+        PayloadKind::NewScreen => "new_screen",
+        PayloadKind::Remove => "remove",
+        PayloadKind::HideApp => "hide_app",
+        PayloadKind::Ban => "ban",
+        PayloadKind::Charles => "charles",
+        PayloadKind::Unknown(value) => value.as_str(),
+    }
+    .to_string()
+}
+
+fn payload_summary(payload: &Payload) -> String {
+    match &payload.kind {
+        PayloadKind::Log => summarize_log(payload).unwrap_or_else(|| "log payload".to_string()),
+        PayloadKind::Custom | PayloadKind::Boolean => {
+            let label = payload.content_string("label");
+            let body = payload
+                .content_object()
+                .and_then(|map| map.get("content"))
+                .map(value_preview)
+                .unwrap_or_else(|| "custom payload".to_string());
+
+            match label {
+                Some(label) if !label.is_empty() => clip(&format!("{}: {}", label, body), 80),
+                _ => clip(&body, 80),
+            }
+        }
+        PayloadKind::CreateLock => {
+            let name = payload.content_string("name").unwrap_or("unknown");
+            format!("create lock `{}`", name)
+        }
+        PayloadKind::ClearAll => "clear all".to_string(),
+        PayloadKind::Hide => "hide payload".to_string(),
+        PayloadKind::ShowApp => "show app".to_string(),
+        PayloadKind::ShowBrowser => "show browser".to_string(),
+        PayloadKind::Notify => payload
+            .content_string("text")
+            .map(|text| clip(text, 80))
+            .unwrap_or_else(|| "notification".to_string()),
+        PayloadKind::Separator => "separator".to_string(),
+        PayloadKind::Exception => payload
+            .content_object()
+            .and_then(|map| map.get("message"))
+            .map(value_preview)
+            .unwrap_or_else(|| "exception".to_string()),
+        PayloadKind::Table => "table".to_string(),
+        PayloadKind::Text => payload
+            .content_string("content")
+            .map(|text| clip(text, 80))
+            .unwrap_or_else(|| "text".to_string()),
+        PayloadKind::Image => "image".to_string(),
+        PayloadKind::JsonString => "json string".to_string(),
+        PayloadKind::DecodedJson => payload
+            .content_object()
+            .map(|map| {
+                let json = Value::Object(map.clone()).to_string();
+                clip(&flatten(&json), 80)
+            })
+            .unwrap_or_else(|| "json".to_string()),
+        PayloadKind::Size => payload
+            .content_string("size")
+            .map(|value| format!("size {}", value))
+            .unwrap_or_else(|| "size".to_string()),
+        PayloadKind::Color => payload
+            .content_string("color")
+            .map(|value| format!("color {}", value))
+            .unwrap_or_else(|| "color".to_string()),
+        PayloadKind::Trace => "stack trace".to_string(),
+        PayloadKind::Caller => "caller".to_string(),
+        PayloadKind::Measure => payload
+            .content_object()
+            .and_then(|map| map.get("name"))
+            .map(value_preview)
+            .map(|name| format!("measure {}", name))
+            .unwrap_or_else(|| "measure".to_string()),
+        PayloadKind::PhpInfo => "phpinfo".to_string(),
+        PayloadKind::NewScreen => payload
+            .content_string("name")
+            .map(|name| format!("new screen `{}`", name))
+            .unwrap_or_else(|| "new screen".to_string()),
+        PayloadKind::Remove => "remove".to_string(),
+        PayloadKind::HideApp => "hide app".to_string(),
+        PayloadKind::Ban => "ban".to_string(),
+        PayloadKind::Charles => "charles".to_string(),
+        PayloadKind::Unknown(name) => format!("{} payload", name),
+    }
+}
+
+fn summarize_log(payload: &Payload) -> Option<String> {
+    let meta_clipboard = payload
+        .content_object()
+        .and_then(|map| map.get("meta"))
+        .and_then(|meta| meta.as_array())
+        .and_then(|meta| meta.first())
+        .and_then(|entry| entry.get("clipboard_data"))
+        .and_then(|value| value.as_str())
+        .map(flatten);
+
+    if let Some(clipboard) = meta_clipboard {
+        if !clipboard.is_empty() {
+            return Some(clip(&clipboard, 80));
+        }
+    }
+
+    payload
+        .content_object()
+        .and_then(|map| map.get("values"))
+        .and_then(|values| values.as_array())
+        .and_then(|values| values.first())
+        .map(value_preview)
+}
+
+fn value_preview(value: &Value) -> String {
+    match value {
+        Value::String(text) => clip(&flatten(text), 80),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(_) | Value::Object(_) => clip(&flatten(&value.to_string()), 80),
+    }
+}
+
+fn clip(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", truncated)
+}
+
+fn flatten(text: &str) -> String {
+    let decoded = decode_html_entities(text).into_owned();
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 1 {
+        "<1s ago".to_string()
+    } else if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3_600 {
+        let minutes = secs / 60;
+        let seconds = secs % 60;
+        format!("{}m {:02}s ago", minutes, seconds)
+    } else {
+        let hours = secs / 3_600;
+        let minutes = (secs % 3_600) / 60;
+        format!("{}h {:02}m ago", hours, minutes)
+    }
+}
