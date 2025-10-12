@@ -22,6 +22,14 @@ pub struct RaygunApp {
     server: Option<server::ServerHandle>,
     server_addr: SocketAddr,
     selected: Option<usize>,
+    focus: Focus,
+    detail_scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Timeline,
+    Detail,
 }
 
 const TIMELINE_VIEW_LIMIT: usize = 200;
@@ -43,6 +51,8 @@ impl RaygunApp {
             server: Some(server),
             server_addr,
             selected: None,
+            focus: Focus::Timeline,
+            detail_scroll: 0,
         })
     }
 
@@ -56,13 +66,27 @@ impl RaygunApp {
         loop {
             let view_model = self.build_view_model().await;
             let timeline_len = view_model.timeline.len();
+            let detail_len = view_model
+                .detail
+                .as_ref()
+                .map(|detail| {
+                    let mut len = detail.lines.len();
+                    if !detail.header.is_empty() {
+                        len += 2;
+                    }
+                    if !detail.footer.is_empty() {
+                        len += 2;
+                    }
+                    len
+                })
+                .unwrap_or(0);
 
             terminal.draw(|frame| tui::render_app(frame, &view_model))?;
 
             let exit_requested = select! {
                 maybe_event = rx.recv() => {
                     match maybe_event {
-                        Some(event) => self.handle_event(event, timeline_len),
+                        Some(event) => self.handle_event(event, timeline_len, detail_len),
                         None => true,
                     }
                 }
@@ -103,11 +127,19 @@ impl RaygunApp {
             ordered_events.truncate(TIMELINE_VIEW_LIMIT);
         }
 
+        let previous_selection = self.selected;
+
         if ordered_events.is_empty() {
             self.selected = None;
+            self.detail_scroll = 0;
         } else {
             let max_index = ordered_events.len().saturating_sub(1);
-            self.selected = Some(self.selected.unwrap_or(0).min(max_index));
+            let clamped = self.selected.unwrap_or(0).min(max_index);
+            self.selected = Some(clamped);
+        }
+
+        if self.selected != previous_selection {
+            self.detail_scroll = 0;
         }
 
         let timeline = ordered_events
@@ -127,45 +159,100 @@ impl RaygunApp {
             })
             .map(|(payload, event)| build_detail_view(payload, event.received_at));
 
+        if let Some(detail) = &detail {
+            if detail.lines.is_empty() {
+                self.detail_scroll = 0;
+            } else {
+                self.detail_scroll = self.detail_scroll.min(detail.lines.len().saturating_sub(1));
+            }
+        } else {
+            self.detail_scroll = 0;
+        }
+
         AppViewModel {
             total_events: self.state.timeline_len().await,
             bind_addr: self.server_addr,
             timeline,
             selected: self.selected,
             detail,
+            focus_detail: matches!(self.focus, Focus::Detail),
+            detail_scroll: self.detail_scroll,
         }
     }
 
-    fn handle_event(&mut self, event: Event, timeline_len: usize) -> bool {
+    fn handle_event(&mut self, event: Event, timeline_len: usize, detail_len: usize) -> bool {
         match event {
             Event::Input(key) => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+                KeyCode::Tab => {
+                    self.focus = match self.focus {
+                        Focus::Timeline => Focus::Detail,
+                        Focus::Detail => Focus::Timeline,
+                    };
+                    false
+                }
+                KeyCode::BackTab => {
+                    self.focus = Focus::Timeline;
+                    false
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.move_selection(1, timeline_len);
+                    if self.focus == Focus::Timeline {
+                        if self.move_selection(1, timeline_len) {
+                            self.detail_scroll = 0;
+                        }
+                    } else {
+                        self.scroll_detail(1, detail_len);
+                    }
                     false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.move_selection(-1, timeline_len);
+                    if self.focus == Focus::Timeline {
+                        if self.move_selection(-1, timeline_len) {
+                            self.detail_scroll = 0;
+                        }
+                    } else {
+                        self.scroll_detail(-1, detail_len);
+                    }
                     false
                 }
                 KeyCode::PageDown => {
-                    self.move_selection(10, timeline_len);
+                    if self.focus == Focus::Timeline {
+                        if self.move_selection(10, timeline_len) {
+                            self.detail_scroll = 0;
+                        }
+                    } else {
+                        self.scroll_detail(10, detail_len);
+                    }
                     false
                 }
                 KeyCode::PageUp => {
-                    self.move_selection(-10, timeline_len);
+                    if self.focus == Focus::Timeline {
+                        if self.move_selection(-10, timeline_len) {
+                            self.detail_scroll = 0;
+                        }
+                    } else {
+                        self.scroll_detail(-10, detail_len);
+                    }
                     false
                 }
                 KeyCode::Home => {
-                    if timeline_len > 0 {
+                    if timeline_len > 0 && self.focus == Focus::Timeline {
                         self.selected = Some(0);
+                        self.detail_scroll = 0;
+                    } else if self.focus == Focus::Detail {
+                        self.detail_scroll = 0;
                     }
                     false
                 }
                 KeyCode::End => {
-                    if timeline_len > 0 {
+                    if timeline_len > 0 && self.focus == Focus::Timeline {
                         self.selected = Some(timeline_len.saturating_sub(1));
+                        self.detail_scroll = 0;
+                    } else if self.focus == Focus::Detail {
+                        if detail_len > 0 {
+                            self.detail_scroll = detail_len.saturating_sub(1);
+                        }
                     }
                     false
                 }
@@ -179,15 +266,29 @@ impl RaygunApp {
         }
     }
 
-    fn move_selection(&mut self, delta: i32, len: usize) {
+    fn move_selection(&mut self, delta: i32, len: usize) -> bool {
         if len == 0 {
             self.selected = None;
-            return;
+            return false;
         }
 
         let current = self.selected.unwrap_or(0) as i32;
         let new_index = (current + delta).clamp(0, len.saturating_sub(1) as i32) as usize;
+        let changed = self.selected != Some(new_index);
         self.selected = Some(new_index);
+        changed
+    }
+
+    fn scroll_detail(&mut self, delta: i32, len: usize) {
+        if len == 0 {
+            self.detail_scroll = 0;
+            return;
+        }
+
+        let current = self.detail_scroll as i32;
+        let max_scroll = len.saturating_sub(1) as i32;
+        let new_scroll = (current + delta).clamp(0, max_scroll) as usize;
+        self.detail_scroll = new_scroll;
     }
 }
 

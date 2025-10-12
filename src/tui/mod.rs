@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::ui::detail::DetailViewModel;
+use crate::ui::detail::{DetailSegment, DetailViewModel, SegmentStyle};
 use color_eyre::Result;
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyEvent},
@@ -16,6 +16,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use tokio::{sync::mpsc, task};
@@ -42,6 +43,8 @@ pub struct AppViewModel {
     pub timeline: Vec<TimelineEntry>,
     pub selected: Option<usize>,
     pub detail: Option<DetailViewModel>,
+    pub focus_detail: bool,
+    pub detail_scroll: usize,
 }
 
 pub struct TerminalGuard {
@@ -168,7 +171,11 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
     let block = Block::default()
         .title("Timeline")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(if view_model.focus_detail {
+            Color::DarkGray
+        } else {
+            Color::Cyan
+        }))
         .title_style(
             Style::default()
                 .fg(Color::LightBlue)
@@ -213,7 +220,11 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
     let block = Block::default()
         .title("Details")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(if view_model.focus_detail {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
         .title_style(
             Style::default()
                 .fg(Color::LightBlue)
@@ -225,24 +236,46 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
     let inner_area = inner(area);
 
     if let Some(detail) = &view_model.detail {
-        let mut content = String::new();
+        let mut lines: Vec<Line> = Vec::new();
 
         if !detail.header.is_empty() {
-            content.push_str(&detail.header);
-            content.push_str("\n\n");
+            lines.push(Line::from(vec![Span::styled(
+                detail.header.clone(),
+                Style::default()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::default());
         }
 
-        for line in &detail.body {
-            content.push_str(line);
-            content.push('\n');
+        for detail_line in &detail.lines {
+            let mut spans = Vec::new();
+            if detail_line.indent > 0 {
+                spans.push(Span::raw("  ".repeat(detail_line.indent)));
+            }
+            for segment in &detail_line.segments {
+                spans.push(Span::styled(
+                    segment.text.clone(),
+                    style_for_segment(segment),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
         if !detail.footer.is_empty() {
-            content.push_str("\n");
-            content.push_str(&detail.footer);
+            lines.push(Line::default());
+            lines.push(Line::from(vec![Span::styled(
+                detail.footer.clone(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
         }
 
-        let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
+        let scroll = view_model.detail_scroll.min(u16::MAX as usize) as u16;
+        let paragraph = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
         frame.render_widget(paragraph, inner_area);
     } else {
         let paragraph =
@@ -258,7 +291,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .style(Style::default().fg(Color::DarkGray));
 
     let content = Paragraph::new(
-        "q/esc quit · ctrl+c quit · ↑/↓ navigate · PgUp/PgDn jump · coming soon: filter, palette, search",
+        "q/esc quit · ctrl+c quit · Tab focus detail · ↑/↓ navigate · PgUp/PgDn jump · coming soon: expand/collapse",
     )
     .style(Style::default().fg(Color::DarkGray));
 
@@ -272,5 +305,17 @@ fn inner(area: Rect) -> Rect {
         y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
+    }
+}
+
+fn style_for_segment(segment: &DetailSegment) -> Style {
+    match segment.style {
+        SegmentStyle::Plain => Style::default().fg(Color::Gray),
+        SegmentStyle::Key => Style::default().fg(Color::Cyan),
+        SegmentStyle::Type => Style::default().fg(Color::Yellow),
+        SegmentStyle::String => Style::default().fg(Color::Green),
+        SegmentStyle::Number => Style::default().fg(Color::LightMagenta),
+        SegmentStyle::Boolean => Style::default().fg(Color::LightBlue),
+        SegmentStyle::Null => Style::default().fg(Color::DarkGray),
     }
 }
