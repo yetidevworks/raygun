@@ -20,7 +20,8 @@ timeline list.
 
 1. Keep one terminal per workspace: one for `cargo watch -x 'run -- --bind …'`
    and another to run unit tests.
-2. Navigate the timeline with `↑/↓` or `j/k`; `PgUp/PgDn` jump 10 entries. The
-   details pane follows the highlighted row. Quit with `q`, `Esc`, or `Ctrl+C`.
+2. Navigate the timeline with `↑/↓` or `j/k`; `PgUp/PgDn` jump 10 entries. Use
+   `Tab` to focus the details pane (scroll with the same keys) and `Ctrl+L` to
+   cycle timeline/detail layout presets. Quit with `q`, `Esc`, or `Ctrl+C`.
 3. If the port is already in use, Raygun fails to bind; choose another port via
    `--bind 127.0.0.1:23518` while testing.

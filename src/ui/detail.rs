@@ -14,6 +14,19 @@ pub struct DetailViewModel {
     pub lines: Vec<DetailLine>,
 }
 
+impl DetailViewModel {
+    pub fn total_line_count(&self) -> usize {
+        let mut len = self.lines.len();
+        if !self.header.is_empty() {
+            len += 2;
+        }
+        if !self.footer.is_empty() {
+            len += 2;
+        }
+        len
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DetailLine {
     pub indent: usize,

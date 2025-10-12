@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -12,9 +12,10 @@ use crate::{
     protocol::{Payload, PayloadKind},
     server,
     state::{AppState, TimelineEvent},
-    tui::{self, AppViewModel, Event, TerminalGuard, TimelineEntry},
+    tui::{self, AppViewModel, Event, LayoutConfig, TerminalGuard, TimelineEntry},
     ui::detail::build_detail_view,
 };
+use uuid::Uuid;
 
 pub struct RaygunApp {
     tick_rate: Duration,
@@ -24,6 +25,9 @@ pub struct RaygunApp {
     selected: Option<usize>,
     focus: Focus,
     detail_scroll: usize,
+    layout: LayoutPreset,
+    detail_states: HashMap<Uuid, DetailState>,
+    visible_events: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +57,9 @@ impl RaygunApp {
             selected: None,
             focus: Focus::Timeline,
             detail_scroll: 0,
+            layout: LayoutPreset::DetailFocus,
+            detail_states: HashMap::new(),
+            visible_events: Vec::new(),
         })
     }
 
@@ -69,16 +76,7 @@ impl RaygunApp {
             let detail_len = view_model
                 .detail
                 .as_ref()
-                .map(|detail| {
-                    let mut len = detail.lines.len();
-                    if !detail.header.is_empty() {
-                        len += 2;
-                    }
-                    if !detail.footer.is_empty() {
-                        len += 2;
-                    }
-                    len
-                })
+                .map(|detail| detail.total_line_count())
                 .unwrap_or(0);
 
             terminal.draw(|frame| tui::render_app(frame, &view_model))?;
@@ -147,6 +145,8 @@ impl RaygunApp {
             .map(|event| summarize_event(event))
             .collect::<Vec<_>>();
 
+        self.visible_events = timeline.iter().map(|entry| entry.id).collect();
+
         let detail = self
             .selected
             .and_then(|index| ordered_events.get(index))
@@ -159,11 +159,19 @@ impl RaygunApp {
             })
             .map(|(payload, event)| build_detail_view(payload, event.received_at));
 
-        if let Some(detail) = &detail {
-            if detail.lines.is_empty() {
-                self.detail_scroll = 0;
+        if let Some(event_id) = self.current_event_id() {
+            let entry = self.detail_states.entry(event_id).or_default();
+            if let Some(detail) = &detail {
+                if detail.lines.is_empty() {
+                    entry.scroll = 0;
+                    self.detail_scroll = 0;
+                } else {
+                    self.detail_scroll = entry.scroll.min(detail.lines.len().saturating_sub(1));
+                    entry.scroll = self.detail_scroll;
+                }
             } else {
-                self.detail_scroll = self.detail_scroll.min(detail.lines.len().saturating_sub(1));
+                entry.scroll = 0;
+                self.detail_scroll = 0;
             }
         } else {
             self.detail_scroll = 0;
@@ -177,6 +185,7 @@ impl RaygunApp {
             detail,
             focus_detail: matches!(self.focus, Focus::Detail),
             detail_scroll: self.detail_scroll,
+            layout: self.layout.config(),
         }
     }
 
@@ -196,62 +205,108 @@ impl RaygunApp {
                     self.focus = Focus::Timeline;
                     false
                 }
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.layout = self.layout.next();
+                    false
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if self.focus == Focus::Timeline {
-                        if self.move_selection(1, timeline_len) {
-                            self.detail_scroll = 0;
+                        self.store_detail_state(detail_len);
+                        if let Some(new_index) = self.move_selection(1, timeline_len) {
+                            if let Some(id) = self.visible_events.get(new_index).copied() {
+                                self.detail_scroll = self
+                                    .detail_states
+                                    .get(&id)
+                                    .map(|state| state.scroll)
+                                    .unwrap_or(0);
+                            }
                         }
-                    } else {
-                        self.scroll_detail(1, detail_len);
+                    } else if self.scroll_detail(1, detail_len) {
+                        self.store_detail_state(detail_len);
                     }
                     false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.focus == Focus::Timeline {
-                        if self.move_selection(-1, timeline_len) {
-                            self.detail_scroll = 0;
+                        self.store_detail_state(detail_len);
+                        if let Some(new_index) = self.move_selection(-1, timeline_len) {
+                            if let Some(id) = self.visible_events.get(new_index).copied() {
+                                self.detail_scroll = self
+                                    .detail_states
+                                    .get(&id)
+                                    .map(|state| state.scroll)
+                                    .unwrap_or(0);
+                            }
                         }
-                    } else {
-                        self.scroll_detail(-1, detail_len);
+                    } else if self.scroll_detail(-1, detail_len) {
+                        self.store_detail_state(detail_len);
                     }
                     false
                 }
                 KeyCode::PageDown => {
                     if self.focus == Focus::Timeline {
-                        if self.move_selection(10, timeline_len) {
-                            self.detail_scroll = 0;
+                        self.store_detail_state(detail_len);
+                        if let Some(new_index) = self.move_selection(10, timeline_len) {
+                            if let Some(id) = self.visible_events.get(new_index).copied() {
+                                self.detail_scroll = self
+                                    .detail_states
+                                    .get(&id)
+                                    .map(|state| state.scroll)
+                                    .unwrap_or(0);
+                            }
                         }
-                    } else {
-                        self.scroll_detail(10, detail_len);
+                    } else if self.scroll_detail(10, detail_len) {
+                        self.store_detail_state(detail_len);
                     }
                     false
                 }
                 KeyCode::PageUp => {
                     if self.focus == Focus::Timeline {
-                        if self.move_selection(-10, timeline_len) {
-                            self.detail_scroll = 0;
+                        self.store_detail_state(detail_len);
+                        if let Some(new_index) = self.move_selection(-10, timeline_len) {
+                            if let Some(id) = self.visible_events.get(new_index).copied() {
+                                self.detail_scroll = self
+                                    .detail_states
+                                    .get(&id)
+                                    .map(|state| state.scroll)
+                                    .unwrap_or(0);
+                            }
                         }
-                    } else {
-                        self.scroll_detail(-10, detail_len);
+                    } else if self.scroll_detail(-10, detail_len) {
+                        self.store_detail_state(detail_len);
                     }
                     false
                 }
                 KeyCode::Home => {
                     if timeline_len > 0 && self.focus == Focus::Timeline {
+                        self.store_detail_state(detail_len);
                         self.selected = Some(0);
-                        self.detail_scroll = 0;
+                        if let Some(id) = self.current_event_id() {
+                            self.detail_scroll =
+                                self.detail_states.get(&id).map(|s| s.scroll).unwrap_or(0);
+                        } else {
+                            self.detail_scroll = 0;
+                        }
                     } else if self.focus == Focus::Detail {
                         self.detail_scroll = 0;
+                        self.store_detail_state(detail_len);
                     }
                     false
                 }
                 KeyCode::End => {
                     if timeline_len > 0 && self.focus == Focus::Timeline {
+                        self.store_detail_state(detail_len);
                         self.selected = Some(timeline_len.saturating_sub(1));
-                        self.detail_scroll = 0;
+                        if let Some(id) = self.current_event_id() {
+                            self.detail_scroll =
+                                self.detail_states.get(&id).map(|s| s.scroll).unwrap_or(0);
+                        } else {
+                            self.detail_scroll = 0;
+                        }
                     } else if self.focus == Focus::Detail {
                         if detail_len > 0 {
                             self.detail_scroll = detail_len.saturating_sub(1);
+                            self.store_detail_state(detail_len);
                         }
                     }
                     false
@@ -266,30 +321,88 @@ impl RaygunApp {
         }
     }
 
-    fn move_selection(&mut self, delta: i32, len: usize) -> bool {
+    fn move_selection(&mut self, delta: i32, len: usize) -> Option<usize> {
         if len == 0 {
             self.selected = None;
-            return false;
+            return None;
         }
 
         let current = self.selected.unwrap_or(0) as i32;
         let new_index = (current + delta).clamp(0, len.saturating_sub(1) as i32) as usize;
         let changed = self.selected != Some(new_index);
         self.selected = Some(new_index);
-        changed
+        if changed { Some(new_index) } else { None }
     }
 
-    fn scroll_detail(&mut self, delta: i32, len: usize) {
+    fn scroll_detail(&mut self, delta: i32, len: usize) -> bool {
         if len == 0 {
             self.detail_scroll = 0;
-            return;
+            return false;
         }
 
         let current = self.detail_scroll as i32;
         let max_scroll = len.saturating_sub(1) as i32;
         let new_scroll = (current + delta).clamp(0, max_scroll) as usize;
+        let changed = new_scroll != self.detail_scroll;
         self.detail_scroll = new_scroll;
+        changed
     }
+
+    fn current_event_id(&self) -> Option<Uuid> {
+        self.selected
+            .and_then(|index| self.visible_events.get(index))
+            .copied()
+    }
+
+    fn store_detail_state(&mut self, detail_len: usize) {
+        if let Some(id) = self.current_event_id() {
+            let entry = self.detail_states.entry(id).or_default();
+            if detail_len == 0 {
+                entry.scroll = 0;
+            } else {
+                entry.scroll = self.detail_scroll.min(detail_len.saturating_sub(1));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutPreset {
+    TimelineFocus,
+    Balanced,
+    DetailFocus,
+}
+
+impl LayoutPreset {
+    fn next(self) -> Self {
+        match self {
+            LayoutPreset::TimelineFocus => LayoutPreset::Balanced,
+            LayoutPreset::Balanced => LayoutPreset::DetailFocus,
+            LayoutPreset::DetailFocus => LayoutPreset::TimelineFocus,
+        }
+    }
+
+    fn config(self) -> LayoutConfig {
+        match self {
+            LayoutPreset::TimelineFocus => LayoutConfig {
+                timeline_percent: 65,
+                detail_percent: 35,
+            },
+            LayoutPreset::Balanced => LayoutConfig {
+                timeline_percent: 50,
+                detail_percent: 50,
+            },
+            LayoutPreset::DetailFocus => LayoutConfig {
+                timeline_percent: 33,
+                detail_percent: 67,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DetailState {
+    scroll: usize,
 }
 
 fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
@@ -304,6 +417,7 @@ fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
         }
 
         TimelineEntry {
+            id: event.id,
             kind,
             summary,
             age: format_elapsed(elapsed),
@@ -314,6 +428,7 @@ fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
             summary = format!("{} | {}", screen, summary);
         }
         TimelineEntry {
+            id: event.id,
             kind: "empty".to_string(),
             summary,
             age: format_elapsed(elapsed),

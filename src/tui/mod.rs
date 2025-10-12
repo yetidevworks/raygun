@@ -21,6 +21,7 @@ use ratatui::{
 };
 use tokio::{sync::mpsc, task};
 use tracing::{debug, error};
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum Event {
@@ -31,6 +32,7 @@ pub enum Event {
 
 #[derive(Debug, Clone)]
 pub struct TimelineEntry {
+    pub id: Uuid,
     pub kind: String,
     pub summary: String,
     pub age: String,
@@ -45,6 +47,13 @@ pub struct AppViewModel {
     pub detail: Option<DetailViewModel>,
     pub focus_detail: bool,
     pub detail_scroll: usize,
+    pub layout: LayoutConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutConfig {
+    pub timeline_percent: u16,
+    pub detail_percent: u16,
 }
 
 pub struct TerminalGuard {
@@ -143,8 +152,8 @@ pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Percentage(view_model.layout.timeline_percent),
+            Constraint::Percentage(view_model.layout.detail_percent),
             Constraint::Length(1),
         ])
         .split(frame.size());
@@ -291,7 +300,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .style(Style::default().fg(Color::DarkGray));
 
     let content = Paragraph::new(
-        "q/esc quit · ctrl+c quit · Tab focus detail · ↑/↓ navigate · PgUp/PgDn jump · coming soon: expand/collapse",
+        "q/esc quit · ctrl+c quit · Tab focus detail · ctrl+l cycle layout · ↑/↓ navigate · PgUp/PgDn jump · coming soon: expand/collapse",
     )
     .style(Style::default().fg(Color::DarkGray));
 
