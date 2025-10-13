@@ -1,11 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::ErrorKind,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
 
-use color_eyre::Result;
+use color_eyre::{
+    eyre::{eyre, Report},
+    Result,
+};
 use crossterm::event::{KeyCode, KeyModifiers};
 use html_escape::decode_html_entities;
 use serde_json::Value;
@@ -47,7 +51,12 @@ impl RaygunApp {
     pub async fn bootstrap(config: Config) -> Result<Self> {
         let state = Arc::new(AppState::default());
         let bind_addr = config.bind_addr;
-        let server = server::spawn(Arc::clone(&state), server::ServerConfig { bind_addr }).await?;
+        let server = server::spawn(Arc::clone(&state), server::ServerConfig { bind_addr })
+            .await
+            .map_err(|err| match err {
+                server::ServerError::Io(io_err) if io_err.kind() == ErrorKind::AddrInUse => eyre!("Port {} is already in use. Pass --bind <addr:port> to choose a different address.", bind_addr),
+                other => Report::from(other),
+            })?;
         let server_addr = server.addr();
 
         info!(addr = %server_addr, "HTTP server ready");
@@ -341,15 +350,27 @@ impl RaygunApp {
                     }
                     false
                 }
-                KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+                KeyCode::Right | KeyCode::Enter => {
                     if self.focus == Focus::Detail {
-                        self.expand_current_node(detail_ctx);
+                        if self.expand_current_node(detail_ctx) {
+                            self.store_detail_state(detail_ctx.visible_len());
+                        }
                     }
                     false
                 }
                 KeyCode::Left => {
                     if self.focus == Focus::Detail {
-                        self.collapse_current_node(detail_ctx);
+                        if self.collapse_current_node(detail_ctx) {
+                            self.store_detail_state(detail_ctx.visible_len());
+                        }
+                    }
+                    false
+                }
+                KeyCode::Char(' ') => {
+                    if self.focus == Focus::Detail {
+                        if self.toggle_current_node(detail_ctx) {
+                            self.store_detail_state(detail_ctx.visible_len());
+                        }
                     }
                     false
                 }
@@ -395,30 +416,54 @@ impl RaygunApp {
         }
     }
 
-    fn expand_current_node(&mut self, ctx: &DetailContext) {
+    fn expand_current_node(&mut self, ctx: &DetailContext) -> bool {
         if ctx.visible_len() == 0 {
-            return;
+            return false;
         }
 
         if let Some(state) = self.current_detail_state_mut() {
-            if ctx.visible_len() == 0 {
-                return;
-            }
-
             let cursor = state.cursor.min(ctx.visible_len().saturating_sub(1));
             if let Some(&line_index) = ctx.visible_indices.get(cursor) {
                 if ctx.has_children.get(line_index).copied().unwrap_or(false) {
-                    state.collapsed.remove(&line_index);
+                    if state.collapsed.remove(&line_index) {
+                        state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
+                        self.detail_scroll = state.scroll;
+                        return true;
+                    }
                 }
+
                 state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
                 self.detail_scroll = state.scroll;
             }
         }
+
+        false
     }
 
-    fn collapse_current_node(&mut self, ctx: &DetailContext) {
+    fn toggle_current_node(&mut self, ctx: &DetailContext) -> bool {
         if ctx.visible_len() == 0 {
-            return;
+            return false;
+        }
+
+        if let Some(state) = self.current_detail_state_mut() {
+            let cursor = state.cursor.min(ctx.visible_len().saturating_sub(1));
+            if let Some(&line_index) = ctx.visible_indices.get(cursor) {
+                if ctx.has_children.get(line_index).copied().unwrap_or(false) {
+                    if !state.collapsed.remove(&line_index) {
+                        state.collapsed.insert(line_index);
+                    }
+                    state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
+                    self.detail_scroll = state.scroll;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn collapse_current_node(&mut self, ctx: &DetailContext) -> bool {
+        if ctx.visible_len() == 0 {
+            return false;
         }
 
         if let Some(state) = self.current_detail_state_mut() {
@@ -431,22 +476,24 @@ impl RaygunApp {
 
                 if ctx.has_children.get(line_index).copied().unwrap_or(false) {
                     if !state.collapsed.insert(line_index) {
-                        if indent > 0 {
-                            if let Some((pos, _)) =
-                                ctx.visible_indices[..cursor].iter().enumerate().rev().find(
-                                    |(_, idx)| {
-                                        ctx.detail
-                                            .map(|detail| detail.lines[**idx].indent < indent)
-                                            .unwrap_or(false)
-                                    },
-                                )
-                            {
-                                state.cursor = pos;
-                                state.scroll = pos;
-                                self.detail_scroll = pos;
-                                return;
-                            }
+                        if let Some((pos, _)) =
+                            ctx.visible_indices[..cursor].iter().enumerate().rev().find(
+                                |(_, idx)| {
+                                    ctx.detail
+                                        .map(|detail| detail.lines[**idx].indent < indent)
+                                        .unwrap_or(false)
+                                },
+                            )
+                        {
+                            state.cursor = pos;
+                            state.scroll = pos;
+                            self.detail_scroll = pos;
+                            return true;
                         }
+                    } else {
+                        state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
+                        self.detail_scroll = state.scroll;
+                        return true;
                     }
                 } else if indent > 0 {
                     if let Some((pos, _)) = ctx.visible_indices[..cursor]
@@ -462,14 +509,17 @@ impl RaygunApp {
                         state.cursor = pos;
                         state.scroll = pos;
                         self.detail_scroll = pos;
-                        return;
+                        return true;
                     }
                 }
 
                 state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
                 self.detail_scroll = state.scroll;
+                return true;
             }
         }
+
+        false
     }
 
     fn store_detail_state(&mut self, detail_len: usize) {

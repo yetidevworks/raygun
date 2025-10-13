@@ -119,6 +119,7 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub async fn clear_lock(&self, name: &str) {
         let mut inner = self.inner.write().await;
         inner.locks.remove(name);

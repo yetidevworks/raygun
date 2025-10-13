@@ -4,12 +4,12 @@ Raygun exposes the same HTTP interface as the Spatie Ray desktop app. The
 binary bundles an HTTP server and terminal UI in a single process.
 
 ```bash
-cargo run -- --bind 0.0.0.0:23517
+cargo run
 ```
 
 ## Bind Address
 
-- `--bind <addr>` (defaults to `127.0.0.1:23517`)
+- `--bind <addr>` (defaults to `0.0.0.0:23517`)
 - Environment alternative: `RAYGUN_BIND=0.0.0.0:23517`
 
 Use the address you configure in your PHP project's Ray settings. Once the app
@@ -22,7 +22,7 @@ timeline list.
    and another to run unit tests.
 2. Navigate the timeline with `↑/↓` or `j/k`; `PgUp/PgDn` jump 10 entries. Use
    `Tab` to focus the details pane (same keys to scroll) and `Ctrl+L` to cycle
-   layout presets. While on the details pane use `Enter`/`→` to expand and `←`
-   to collapse nodes. Quit with `q`, `Esc`, or `Ctrl+C`.
+   layout presets. While on the details pane use `Enter`/`→` to expand, `←` to
+   collapse, and `Space` to toggle. Quit with `q`, `Esc`, or `Ctrl+C`.
 3. If the port is already in use, Raygun fails to bind; choose another port via
    `--bind 127.0.0.1:23518` while testing.

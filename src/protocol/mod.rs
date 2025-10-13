@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RayRequest {
     pub uuid: String,
@@ -107,6 +108,7 @@ impl<'de> Deserialize<'de> for PayloadKind {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Origin {
     pub file: Option<String>,

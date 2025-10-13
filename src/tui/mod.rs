@@ -162,7 +162,7 @@ pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
             Constraint::Length(3),
             Constraint::Percentage(view_model.layout.timeline_percent),
             Constraint::Percentage(view_model.layout.detail_percent),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(frame.size());
 
@@ -350,12 +350,21 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .style(Style::default().fg(Color::DarkGray));
 
     let content = Paragraph::new(
-        "q/esc quit · ctrl+c quit · Tab focus detail · ctrl+l cycle layout · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse",
+        "q/esc quit · ctrl+c quit · Tab focus detail · ctrl+l cycle layout · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse · Space toggle",
     )
     .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(block, area);
-    frame.render_widget(content, inner(area));
+
+    if area.height > 1 {
+        let content_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(1),
+        };
+        frame.render_widget(content, content_area);
+    }
 }
 
 fn inner(area: Rect) -> Rect {

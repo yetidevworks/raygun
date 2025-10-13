@@ -386,6 +386,7 @@ fn starts_with_closing_bracket(line: &str) -> bool {
 }
 
 fn ends_with_open_bracket(line: &str) -> bool {
+    let line = line.trim_end_matches(',').trim_end();
     line.ends_with('[')
         || line.ends_with('{')
         || line.ends_with("=> [")
@@ -395,6 +396,7 @@ fn ends_with_open_bracket(line: &str) -> bool {
         || line == "["
         || line == "{"
         || line.starts_with("stdClass#")
+        || line.contains(" {#") && (line.ends_with('▼') || line.ends_with('▶'))
 }
 
 fn is_parenthesis_open(line: &str) -> bool {
@@ -407,9 +409,11 @@ fn is_parenthesis_close(line: &str) -> bool {
 
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static KEY_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"^(\+?\[[^\]]+\]|\+["'][^"']+["'])"#).unwrap());
-static TYPE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(?:stdClass#\d+|array:\d+|object\([^)]*\))").unwrap());
+    Lazy::new(|| Regex::new(r#"^(\+?\[[^\]]+\]|\+["'][^"']+["']|[-+][\w$]+:)"#).unwrap());
+static TYPE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:stdClass#\d+|array:\d+|object\([^)]*\)|[\w\\]+(?:<[^>]+>)?\s*\{#\d+)")
+        .unwrap()
+});
 static BOOL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(true|false)\b").unwrap());
 static NULL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^null\b").unwrap());
 static NUMBER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^-?\d+(?:\.\d+)?").unwrap());
@@ -432,4 +436,46 @@ fn compute_has_children(lines: &[DetailLine]) -> Vec<bool> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nested_sf_dump_with_object_markers() {
+        let dump = r#"
+<span class="sf-dump">array:2 [<br />
+  "name" => "Ray"<br />
+  "meta" => array:1 [<br />
+    "city" => "Ghent"<br />
+  ]<br />
+  "user" => App\User {#1 ▼<br />
+    +name: "Freek"<br />
+    +roles: array:1 [<br />
+      0 => "admin"<br />
+    ]<br />
+  }<br />
+]<br />
+</span>
+"#;
+
+        let lines = parse_sf_dump(dump);
+        let indents: Vec<usize> = lines.iter().map(|line| line.indent).collect();
+        assert_eq!(
+            indents,
+            vec![0, 1, 1, 2, 1, 1, 2, 2, 3, 2, 1, 0]
+        );
+
+        let type_segment_present = lines.iter().any(|line| {
+            line.segments.iter().any(|segment| {
+                matches!(segment.style, SegmentStyle::Type)
+                    && segment.text.contains("App\\User {#1")
+            })
+        });
+        assert!(
+            type_segment_present,
+            "expected App\\User {{#1 to be treated as a type segment"
+        );
+    }
 }
