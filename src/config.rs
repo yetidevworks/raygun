@@ -2,9 +2,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
-/// Global CLI configuration for Raygun.
 #[derive(Debug, Clone, Parser)]
-#[command(author, version, about = "Terminal Ray client", long_about = None)]
 pub struct Config {
     /// Address Raygun listens on for Ray payloads.
     #[arg(

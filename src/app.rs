@@ -46,7 +46,7 @@ const TIMELINE_VIEW_LIMIT: usize = 200;
 impl RaygunApp {
     pub async fn bootstrap(config: Config) -> Result<Self> {
         let state = Arc::new(AppState::default());
-        let bind_addr = config.bind_addr.unwrap_or(SocketAddr::from(([0,0,0,0], 23517)));
+        let bind_addr = config.bind_addr;
         let server = server::spawn(Arc::clone(&state), server::ServerConfig { bind_addr }).await?;
         let server_addr = server.addr();
 
@@ -341,7 +341,7 @@ impl RaygunApp {
                     }
                     false
                 }
-                KeyCode::Right | KeyCode::Enter => {
+                KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
                     if self.focus == Focus::Detail {
                         self.expand_current_node(detail_ctx);
                     }

@@ -294,7 +294,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
                 .unwrap_or(false);
 
             let icon = if has_children[line_index] {
-                if collapsed_here { "▸ " } else { "▾ " }
+                if collapsed_here { "+ " } else { "- " }
             } else {
                 "  "
             };
