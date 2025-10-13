@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -12,8 +17,8 @@ use crate::{
     protocol::{Payload, PayloadKind},
     server,
     state::{AppState, TimelineEvent},
-    tui::{self, AppViewModel, Event, LayoutConfig, TerminalGuard, TimelineEntry},
-    ui::detail::build_detail_view,
+    tui::{self, AppViewModel, DetailStateView, Event, LayoutConfig, TerminalGuard, TimelineEntry},
+    ui::detail::{self, build_detail_view},
 };
 use uuid::Uuid;
 
@@ -41,10 +46,8 @@ const TIMELINE_VIEW_LIMIT: usize = 200;
 impl RaygunApp {
     pub async fn bootstrap(config: Config) -> Result<Self> {
         let state = Arc::new(AppState::default());
-        let server_config = server::ServerConfig {
-            bind_addr: config.bind_addr,
-        };
-        let server = server::spawn(Arc::clone(&state), server_config).await?;
+        let bind_addr = config.bind_addr.unwrap_or(SocketAddr::from(([0,0,0,0], 23517)));
+        let server = server::spawn(Arc::clone(&state), server::ServerConfig { bind_addr }).await?;
         let server_addr = server.addr();
 
         info!(addr = %server_addr, "HTTP server ready");
@@ -73,18 +76,21 @@ impl RaygunApp {
         loop {
             let view_model = self.build_view_model().await;
             let timeline_len = view_model.timeline.len();
-            let detail_len = view_model
-                .detail
-                .as_ref()
-                .map(|detail| detail.total_line_count())
-                .unwrap_or(0);
+
+            let detail_context = DetailContext::new(
+                view_model.detail.as_ref(),
+                view_model
+                    .detail_state
+                    .as_ref()
+                    .map(|state| &state.collapsed),
+            );
 
             terminal.draw(|frame| tui::render_app(frame, &view_model))?;
 
             let exit_requested = select! {
                 maybe_event = rx.recv() => {
                     match maybe_event {
-                        Some(event) => self.handle_event(event, timeline_len, detail_len),
+                        Some(event) => self.handle_event(event, timeline_len, &detail_context),
                         None => true,
                     }
                 }
@@ -159,20 +165,35 @@ impl RaygunApp {
             })
             .map(|(payload, event)| build_detail_view(payload, event.received_at));
 
+        let mut detail_state_view = None;
+
         if let Some(event_id) = self.current_event_id() {
             let entry = self.detail_states.entry(event_id).or_default();
             if let Some(detail) = &detail {
-                if detail.lines.is_empty() {
+                let (visible_indices, _) =
+                    detail::visible_indices_with_children(detail, Some(&entry.collapsed));
+                let visible_len = visible_indices.len();
+
+                if visible_len == 0 {
                     entry.scroll = 0;
-                    self.detail_scroll = 0;
+                    entry.cursor = 0;
                 } else {
-                    self.detail_scroll = entry.scroll.min(detail.lines.len().saturating_sub(1));
-                    entry.scroll = self.detail_scroll;
+                    let max = visible_len.saturating_sub(1);
+                    entry.scroll = entry.scroll.min(max);
+                    entry.cursor = entry.cursor.min(max);
                 }
+
+                self.detail_scroll = entry.scroll;
             } else {
                 entry.scroll = 0;
+                entry.cursor = 0;
                 self.detail_scroll = 0;
             }
+
+            detail_state_view = Some(DetailStateView {
+                cursor: entry.cursor,
+                collapsed: entry.collapsed.clone(),
+            });
         } else {
             self.detail_scroll = 0;
         }
@@ -186,10 +207,16 @@ impl RaygunApp {
             focus_detail: matches!(self.focus, Focus::Detail),
             detail_scroll: self.detail_scroll,
             layout: self.layout.config(),
+            detail_state: detail_state_view,
         }
     }
 
-    fn handle_event(&mut self, event: Event, timeline_len: usize, detail_len: usize) -> bool {
+    fn handle_event(
+        &mut self,
+        event: Event,
+        timeline_len: usize,
+        detail_ctx: &DetailContext,
+    ) -> bool {
         match event {
             Event::Input(key) => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => true,
@@ -199,6 +226,12 @@ impl RaygunApp {
                         Focus::Timeline => Focus::Detail,
                         Focus::Detail => Focus::Timeline,
                     };
+                    if let Some(state) = self.current_detail_state() {
+                        self.detail_scroll =
+                            state.scroll.min(detail_ctx.visible_len().saturating_sub(1));
+                    } else {
+                        self.detail_scroll = 0;
+                    }
                     false
                 }
                 KeyCode::BackTab => {
@@ -211,103 +244,112 @@ impl RaygunApp {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_len);
-                        if let Some(new_index) = self.move_selection(1, timeline_len) {
-                            if let Some(id) = self.visible_events.get(new_index).copied() {
-                                self.detail_scroll = self
-                                    .detail_states
-                                    .get(&id)
-                                    .map(|state| state.scroll)
-                                    .unwrap_or(0);
+                        self.store_detail_state(detail_ctx.visible_len());
+                        if self.move_selection(1, timeline_len).is_some() {
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
                             }
                         }
-                    } else if self.scroll_detail(1, detail_len) {
-                        self.store_detail_state(detail_len);
+                    } else {
+                        self.advance_detail_cursor(1, detail_ctx);
                     }
                     false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_len);
-                        if let Some(new_index) = self.move_selection(-1, timeline_len) {
-                            if let Some(id) = self.visible_events.get(new_index).copied() {
-                                self.detail_scroll = self
-                                    .detail_states
-                                    .get(&id)
-                                    .map(|state| state.scroll)
-                                    .unwrap_or(0);
+                        self.store_detail_state(detail_ctx.visible_len());
+                        if self.move_selection(-1, timeline_len).is_some() {
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
                             }
                         }
-                    } else if self.scroll_detail(-1, detail_len) {
-                        self.store_detail_state(detail_len);
+                    } else {
+                        self.advance_detail_cursor(-1, detail_ctx);
                     }
                     false
                 }
                 KeyCode::PageDown => {
                     if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_len);
-                        if let Some(new_index) = self.move_selection(10, timeline_len) {
-                            if let Some(id) = self.visible_events.get(new_index).copied() {
-                                self.detail_scroll = self
-                                    .detail_states
-                                    .get(&id)
-                                    .map(|state| state.scroll)
-                                    .unwrap_or(0);
+                        self.store_detail_state(detail_ctx.visible_len());
+                        if self.move_selection(10, timeline_len).is_some() {
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
                             }
                         }
-                    } else if self.scroll_detail(10, detail_len) {
-                        self.store_detail_state(detail_len);
+                    } else {
+                        self.advance_detail_cursor(10, detail_ctx);
                     }
                     false
                 }
                 KeyCode::PageUp => {
                     if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_len);
-                        if let Some(new_index) = self.move_selection(-10, timeline_len) {
-                            if let Some(id) = self.visible_events.get(new_index).copied() {
-                                self.detail_scroll = self
-                                    .detail_states
-                                    .get(&id)
-                                    .map(|state| state.scroll)
-                                    .unwrap_or(0);
+                        self.store_detail_state(detail_ctx.visible_len());
+                        if self.move_selection(-10, timeline_len).is_some() {
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
                             }
                         }
-                    } else if self.scroll_detail(-10, detail_len) {
-                        self.store_detail_state(detail_len);
+                    } else {
+                        self.advance_detail_cursor(-10, detail_ctx);
                     }
                     false
                 }
                 KeyCode::Home => {
                     if timeline_len > 0 && self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_len);
+                        self.store_detail_state(detail_ctx.visible_len());
                         self.selected = Some(0);
-                        if let Some(id) = self.current_event_id() {
-                            self.detail_scroll =
-                                self.detail_states.get(&id).map(|s| s.scroll).unwrap_or(0);
+                        if let Some(state) = self.current_detail_state() {
+                            self.detail_scroll = state.scroll;
                         } else {
                             self.detail_scroll = 0;
                         }
                     } else if self.focus == Focus::Detail {
-                        self.detail_scroll = 0;
-                        self.store_detail_state(detail_len);
+                        if let Some(state) = self.current_detail_state_mut() {
+                            state.cursor = 0;
+                            state.scroll = 0;
+                            self.detail_scroll = 0;
+                        }
                     }
                     false
                 }
                 KeyCode::End => {
                     if timeline_len > 0 && self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_len);
+                        self.store_detail_state(detail_ctx.visible_len());
                         self.selected = Some(timeline_len.saturating_sub(1));
-                        if let Some(id) = self.current_event_id() {
-                            self.detail_scroll =
-                                self.detail_states.get(&id).map(|s| s.scroll).unwrap_or(0);
+                        if let Some(state) = self.current_detail_state() {
+                            self.detail_scroll = state.scroll;
                         } else {
                             self.detail_scroll = 0;
                         }
                     } else if self.focus == Focus::Detail {
-                        if detail_len > 0 {
-                            self.detail_scroll = detail_len.saturating_sub(1);
-                            self.store_detail_state(detail_len);
+                        if detail_ctx.visible_len() > 0 {
+                            if let Some(state) = self.current_detail_state_mut() {
+                                let max = detail_ctx.visible_len().saturating_sub(1);
+                                state.cursor = max;
+                                state.scroll = max;
+                                self.detail_scroll = max;
+                            }
                         }
+                    }
+                    false
+                }
+                KeyCode::Right | KeyCode::Enter => {
+                    if self.focus == Focus::Detail {
+                        self.expand_current_node(detail_ctx);
+                    }
+                    false
+                }
+                KeyCode::Left => {
+                    if self.focus == Focus::Detail {
+                        self.collapse_current_node(detail_ctx);
                     }
                     false
                 }
@@ -334,18 +376,116 @@ impl RaygunApp {
         if changed { Some(new_index) } else { None }
     }
 
-    fn scroll_detail(&mut self, delta: i32, len: usize) -> bool {
-        if len == 0 {
+    fn advance_detail_cursor(&mut self, delta: i32, ctx: &DetailContext) {
+        if ctx.visible_len() == 0 {
             self.detail_scroll = 0;
-            return false;
+            if let Some(state) = self.current_detail_state_mut() {
+                state.cursor = 0;
+                state.scroll = 0;
+            }
+            return;
         }
 
-        let current = self.detail_scroll as i32;
-        let max_scroll = len.saturating_sub(1) as i32;
-        let new_scroll = (current + delta).clamp(0, max_scroll) as usize;
-        let changed = new_scroll != self.detail_scroll;
-        self.detail_scroll = new_scroll;
-        changed
+        if let Some(state) = self.current_detail_state_mut() {
+            let max = ctx.visible_len().saturating_sub(1) as i32;
+            let new_cursor = (state.cursor as i32 + delta).clamp(0, max) as usize;
+            state.cursor = new_cursor;
+            state.scroll = new_cursor;
+            self.detail_scroll = new_cursor;
+        }
+    }
+
+    fn expand_current_node(&mut self, ctx: &DetailContext) {
+        if ctx.visible_len() == 0 {
+            return;
+        }
+
+        if let Some(state) = self.current_detail_state_mut() {
+            if ctx.visible_len() == 0 {
+                return;
+            }
+
+            let cursor = state.cursor.min(ctx.visible_len().saturating_sub(1));
+            if let Some(&line_index) = ctx.visible_indices.get(cursor) {
+                if ctx.has_children.get(line_index).copied().unwrap_or(false) {
+                    state.collapsed.remove(&line_index);
+                }
+                state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
+                self.detail_scroll = state.scroll;
+            }
+        }
+    }
+
+    fn collapse_current_node(&mut self, ctx: &DetailContext) {
+        if ctx.visible_len() == 0 {
+            return;
+        }
+
+        if let Some(state) = self.current_detail_state_mut() {
+            let cursor = state.cursor.min(ctx.visible_len().saturating_sub(1));
+            if let Some(&line_index) = ctx.visible_indices.get(cursor) {
+                let indent = ctx
+                    .detail
+                    .map(|detail| detail.lines[line_index].indent)
+                    .unwrap_or(0);
+
+                if ctx.has_children.get(line_index).copied().unwrap_or(false) {
+                    if !state.collapsed.insert(line_index) {
+                        if indent > 0 {
+                            if let Some((pos, _)) =
+                                ctx.visible_indices[..cursor].iter().enumerate().rev().find(
+                                    |(_, idx)| {
+                                        ctx.detail
+                                            .map(|detail| detail.lines[**idx].indent < indent)
+                                            .unwrap_or(false)
+                                    },
+                                )
+                            {
+                                state.cursor = pos;
+                                state.scroll = pos;
+                                self.detail_scroll = pos;
+                                return;
+                            }
+                        }
+                    }
+                } else if indent > 0 {
+                    if let Some((pos, _)) = ctx.visible_indices[..cursor]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, idx)| {
+                            ctx.detail
+                                .map(|detail| detail.lines[**idx].indent < indent)
+                                .unwrap_or(false)
+                        })
+                    {
+                        state.cursor = pos;
+                        state.scroll = pos;
+                        self.detail_scroll = pos;
+                        return;
+                    }
+                }
+
+                state.scroll = state.cursor.min(ctx.visible_len().saturating_sub(1));
+                self.detail_scroll = state.scroll;
+            }
+        }
+    }
+
+    fn store_detail_state(&mut self, detail_len: usize) {
+        let scroll = self.detail_scroll;
+        if let Some(state) = self.current_detail_state_mut() {
+            if detail_len == 0 {
+                state.scroll = 0;
+                state.cursor = 0;
+                self.detail_scroll = 0;
+            } else {
+                let max = detail_len.saturating_sub(1);
+                state.scroll = scroll.min(max);
+                state.cursor = state.cursor.min(max);
+                self.detail_scroll = state.scroll;
+            }
+        }
     }
 
     fn current_event_id(&self) -> Option<Uuid> {
@@ -354,15 +494,14 @@ impl RaygunApp {
             .copied()
     }
 
-    fn store_detail_state(&mut self, detail_len: usize) {
-        if let Some(id) = self.current_event_id() {
-            let entry = self.detail_states.entry(id).or_default();
-            if detail_len == 0 {
-                entry.scroll = 0;
-            } else {
-                entry.scroll = self.detail_scroll.min(detail_len.saturating_sub(1));
-            }
-        }
+    fn current_detail_state(&self) -> Option<&DetailState> {
+        self.current_event_id()
+            .and_then(|id| self.detail_states.get(&id))
+    }
+
+    fn current_detail_state_mut(&mut self) -> Option<&mut DetailState> {
+        let id = self.current_event_id()?;
+        Some(self.detail_states.entry(id).or_default())
     }
 }
 
@@ -400,9 +539,44 @@ impl LayoutPreset {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 struct DetailState {
     scroll: usize,
+    cursor: usize,
+    collapsed: HashSet<usize>,
+}
+
+struct DetailContext<'a> {
+    detail: Option<&'a detail::DetailViewModel>,
+    visible_indices: Vec<usize>,
+    has_children: Vec<bool>,
+}
+
+impl<'a> DetailContext<'a> {
+    fn new(
+        detail: Option<&'a detail::DetailViewModel>,
+        collapsed: Option<&HashSet<usize>>,
+    ) -> Self {
+        if let Some(detail_ref) = detail {
+            let (visible_indices, has_children) =
+                detail::visible_indices_with_children(detail_ref, collapsed);
+            Self {
+                detail,
+                visible_indices,
+                has_children,
+            }
+        } else {
+            Self {
+                detail,
+                visible_indices: Vec::new(),
+                has_children: Vec::new(),
+            }
+        }
+    }
+
+    fn visible_len(&self) -> usize {
+        self.visible_indices.len()
+    }
 }
 
 fn summarize_event(event: &TimelineEvent) -> TimelineEntry {

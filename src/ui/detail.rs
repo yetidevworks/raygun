@@ -4,6 +4,7 @@ use html_escape::decode_html_entities;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::protocol::{Payload, PayloadKind};
 
@@ -12,19 +13,6 @@ pub struct DetailViewModel {
     pub header: String,
     pub footer: String,
     pub lines: Vec<DetailLine>,
-}
-
-impl DetailViewModel {
-    pub fn total_line_count(&self) -> usize {
-        let mut len = self.lines.len();
-        if !self.header.is_empty() {
-            len += 2;
-        }
-        if !self.footer.is_empty() {
-            len += 2;
-        }
-        len
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +67,34 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         footer,
         lines,
     }
+}
+
+pub fn visible_indices_with_children(
+    detail: &DetailViewModel,
+    collapsed: Option<&HashSet<usize>>,
+) -> (Vec<usize>, Vec<bool>) {
+    let has_children = compute_has_children(&detail.lines);
+    let mut visible = Vec::new();
+    let mut hidden_indent: Option<usize> = None;
+
+    for (index, line) in detail.lines.iter().enumerate() {
+        if let Some(indent) = hidden_indent {
+            if line.indent > indent {
+                continue;
+            }
+            hidden_indent = None;
+        }
+
+        visible.push(index);
+
+        let is_collapsed = collapsed.map(|set| set.contains(&index)).unwrap_or(false);
+
+        if has_children[index] && is_collapsed {
+            hidden_indent = Some(line.indent);
+        }
+    }
+
+    (visible, has_children)
 }
 
 fn payload_label(kind: &PayloadKind) -> &'static str {
@@ -170,17 +186,42 @@ fn parse_plain_line(line: &str) -> DetailLine {
 
 fn parse_sf_dump(dump: &str) -> Vec<DetailLine> {
     let sanitized = sanitize_sf_dump(dump);
+    let mut lines = Vec::new();
+    let mut indent = 0usize;
 
-    sanitized
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(parse_highlighted_line)
-        .collect()
+    for raw_line in sanitized.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if is_parenthesis_open(trimmed) {
+            indent = indent.saturating_add(1);
+            continue;
+        }
+
+        if is_parenthesis_close(trimmed) {
+            indent = indent.saturating_sub(1);
+            continue;
+        }
+
+        if starts_with_closing_bracket(trimmed) {
+            indent = indent.saturating_sub(1);
+        }
+
+        let line = parse_highlighted_line(trimmed, indent);
+        lines.push(line);
+
+        if ends_with_open_bracket(trimmed) {
+            indent = indent.saturating_add(1);
+        }
+    }
+
+    lines
 }
 
-fn parse_highlighted_line(line: &str) -> DetailLine {
-    let indent = count_indent(line);
-    let trimmed = line.trim_start();
+fn parse_highlighted_line(line: &str, indent: usize) -> DetailLine {
+    let trimmed = line;
     let mut segments = Vec::new();
     let mut cursor = 0;
 
@@ -335,6 +376,35 @@ fn humanize_timestamp(time: SystemTime) -> String {
     }
 }
 
+fn starts_with_closing_bracket(line: &str) -> bool {
+    line.starts_with(']')
+        || line.starts_with("]")
+        || line.starts_with("] ")
+        || line.starts_with("],")
+        || line.starts_with('}')
+        || line.starts_with("},")
+}
+
+fn ends_with_open_bracket(line: &str) -> bool {
+    line.ends_with('[')
+        || line.ends_with('{')
+        || line.ends_with("=> [")
+        || line.ends_with("=> {")
+        || line.ends_with("=> array(")
+        || line.ends_with("=> array:")
+        || line == "["
+        || line == "{"
+        || line.starts_with("stdClass#")
+}
+
+fn is_parenthesis_open(line: &str) -> bool {
+    line == "("
+}
+
+fn is_parenthesis_close(line: &str) -> bool {
+    line == ")" || line == "),"
+}
+
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"^(\+?\[[^\]]+\]|\+["'][^"']+["'])"#).unwrap());
@@ -343,3 +413,23 @@ static TYPE_RE: Lazy<Regex> =
 static BOOL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(true|false)\b").unwrap());
 static NULL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^null\b").unwrap());
 static NUMBER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^-?\d+(?:\.\d+)?").unwrap());
+
+fn compute_has_children(lines: &[DetailLine]) -> Vec<bool> {
+    let mut result = vec![false; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let current_indent = line.indent;
+        let mut walker = index + 1;
+        while walker < lines.len() {
+            let next_indent = lines[walker].indent;
+            if next_indent <= current_indent {
+                break;
+            }
+            if next_indent == current_indent + 1 {
+                result[index] = true;
+                break;
+            }
+            walker += 1;
+        }
+    }
+    result
+}

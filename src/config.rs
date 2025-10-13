@@ -12,7 +12,7 @@ pub struct Config {
         alias = "bind-addr",
         env = "RAYGUN_BIND",
         value_name = "ADDR",
-        default_value = "127.0.0.1:23517",
+        default_value = "0.0.0.0:23517",
         help = "Bind address for incoming Ray HTTP requests"
     )]
     pub bind_addr: SocketAddr,

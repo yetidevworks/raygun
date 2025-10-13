@@ -1,10 +1,11 @@
 use std::{
+    collections::HashSet,
     io::{self, Stdout},
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
-use crate::ui::detail::{DetailSegment, DetailViewModel, SegmentStyle};
+use crate::ui::detail::{self, DetailSegment, DetailViewModel, SegmentStyle};
 use color_eyre::Result;
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyEvent},
@@ -48,12 +49,19 @@ pub struct AppViewModel {
     pub focus_detail: bool,
     pub detail_scroll: usize,
     pub layout: LayoutConfig,
+    pub detail_state: Option<DetailStateView>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutConfig {
     pub timeline_percent: u16,
     pub detail_percent: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct DetailStateView {
+    pub cursor: usize,
+    pub collapsed: HashSet<usize>,
 }
 
 pub struct TerminalGuard {
@@ -245,6 +253,10 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
     let inner_area = inner(area);
 
     if let Some(detail) = &view_model.detail {
+        let state_view = view_model.detail_state.as_ref();
+        let (visible_indices, has_children) =
+            detail::visible_indices_with_children(detail, state_view.map(|state| &state.collapsed));
+
         let mut lines: Vec<Line> = Vec::new();
 
         if !detail.header.is_empty() {
@@ -257,17 +269,55 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
             lines.push(Line::default());
         }
 
-        for detail_line in &detail.lines {
+        let highlight_target = state_view
+            .filter(|_| view_model.focus_detail)
+            .map(|state| state.cursor.min(visible_indices.len().saturating_sub(1)));
+
+        for (position, &line_index) in visible_indices.iter().enumerate() {
+            let detail_line = &detail.lines[line_index];
             let mut spans = Vec::new();
+
+            let is_selected = highlight_target == Some(position);
+
+            let highlight_style = if is_selected {
+                Some(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                None
+            };
+
+            let collapsed_here = state_view
+                .map(|state| state.collapsed.contains(&line_index))
+                .unwrap_or(false);
+
+            let icon = if has_children[line_index] {
+                if collapsed_here { "▸ " } else { "▾ " }
+            } else {
+                "  "
+            };
+
+            let mut indent_style = Style::default().fg(Color::DarkGray);
+            if let Some(style) = highlight_style {
+                indent_style = indent_style.patch(style);
+            }
+
             if detail_line.indent > 0 {
-                spans.push(Span::raw("  ".repeat(detail_line.indent)));
+                spans.push(Span::styled("  ".repeat(detail_line.indent), indent_style));
             }
+
+            spans.push(Span::styled(icon.to_string(), indent_style));
+
             for segment in &detail_line.segments {
-                spans.push(Span::styled(
-                    segment.text.clone(),
-                    style_for_segment(segment),
-                ));
+                let mut style = style_for_segment(segment);
+                if let Some(highlight) = highlight_style {
+                    style = style.patch(highlight);
+                }
+                spans.push(Span::styled(segment.text.clone(), style));
             }
+
             lines.push(Line::from(spans));
         }
 
@@ -300,7 +350,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .style(Style::default().fg(Color::DarkGray));
 
     let content = Paragraph::new(
-        "q/esc quit · ctrl+c quit · Tab focus detail · ctrl+l cycle layout · ↑/↓ navigate · PgUp/PgDn jump · coming soon: expand/collapse",
+        "q/esc quit · ctrl+c quit · Tab focus detail · ctrl+l cycle layout · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse",
     )
     .style(Style::default().fg(Color::DarkGray));
 
