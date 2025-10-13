@@ -41,6 +41,7 @@ pub struct RaygunApp {
     available_colors: Vec<String>,
     show_help: bool,
     show_debug: bool,
+    debug_scroll: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,7 @@ impl RaygunApp {
             available_colors: Vec::new(),
             show_help: false,
             show_debug: false,
+            debug_scroll: 0,
         })
     }
 
@@ -168,6 +170,7 @@ impl RaygunApp {
 
         if ordered_events.is_empty() {
             self.show_debug = false;
+            self.debug_scroll = 0;
         }
 
         let previous_selection = self.selected;
@@ -253,6 +256,7 @@ impl RaygunApp {
             available_colors: self.available_colors.clone(),
             show_help: self.show_help,
             debug_json,
+            debug_scroll: self.debug_scroll,
         }
     }
 
@@ -269,7 +273,6 @@ impl RaygunApp {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
                         KeyCode::Char('q')
                         | KeyCode::Char('Q')
-                        | KeyCode::Esc
                         | KeyCode::Enter
                         | KeyCode::Char('?') => {
                             self.show_help = false;
@@ -279,15 +282,58 @@ impl RaygunApp {
                     };
                 }
 
+                if self.show_debug {
+                    return match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.show_debug = false;
+                            self.debug_scroll = 0;
+                            false
+                        }
+                        KeyCode::Enter => {
+                            self.show_debug = false;
+                            self.debug_scroll = 0;
+                            false
+                        }
+                        KeyCode::Up => {
+                            self.debug_scroll = self.debug_scroll.saturating_sub(1);
+                            false
+                        }
+                        KeyCode::Down => {
+                            self.debug_scroll = self.debug_scroll.saturating_add(1);
+                            false
+                        }
+                        KeyCode::PageUp => {
+                            self.debug_scroll = self.debug_scroll.saturating_sub(10);
+                            false
+                        }
+                        KeyCode::PageDown => {
+                            self.debug_scroll = self.debug_scroll.saturating_add(10);
+                            false
+                        }
+                        KeyCode::Home => {
+                            self.debug_scroll = 0;
+                            false
+                        }
+                        _ => false,
+                    };
+                }
+
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => true,
+                    KeyCode::Char('q') | KeyCode::Char('Q') => true,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
                     KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.clear_local_timeline();
                         false
                     }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.show_debug = !self.show_debug;
+                        if self.show_debug {
+                            self.show_debug = false;
+                            self.debug_scroll = 0;
+                        } else {
+                            self.show_debug = true;
+                            self.debug_scroll = 0;
+                        }
                         false
                     }
                     KeyCode::Char('f') | KeyCode::Char('F') => {
@@ -512,6 +558,7 @@ impl RaygunApp {
         self.color_filter = None;
         self.show_help = false;
         self.show_debug = false;
+        self.debug_scroll = 0;
     }
 
     fn advance_detail_cursor(&mut self, delta: i32, ctx: &DetailContext) {

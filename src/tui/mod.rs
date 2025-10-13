@@ -56,6 +56,7 @@ pub struct AppViewModel {
     pub available_colors: Vec<String>,
     pub show_help: bool,
     pub debug_json: Option<String>,
+    pub debug_scroll: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,7 +181,7 @@ pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     if view_model.show_help {
         render_help_overlay(frame, view_model);
     } else if let Some(json) = view_model.debug_json.as_deref() {
-        render_debug_overlay(frame, json);
+        render_debug_overlay(frame, json, view_model.debug_scroll);
     }
 }
 
@@ -531,7 +532,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_debug_overlay(frame: &mut Frame<'_>, json: &str) {
+fn render_debug_overlay(frame: &mut Frame<'_>, json: &str, scroll: usize) {
     let area = centered_rect(90, 80, frame.size());
     frame.render_widget(Clear, area);
 
@@ -543,6 +544,7 @@ fn render_debug_overlay(frame: &mut Frame<'_>, json: &str) {
     let paragraph = Paragraph::new(json.to_string())
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Gray))
+        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
         .block(block);
 
     frame.render_widget(paragraph, area);

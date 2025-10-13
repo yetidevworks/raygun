@@ -4,7 +4,7 @@ use html_escape::decode_html_entities;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::protocol::{Payload, PayloadKind};
 
@@ -560,6 +560,39 @@ impl TableModel {
             return Some(Self { headers, rows });
         }
 
+        if values.iter().all(|value| value.is_string()) {
+            let mut headers: Vec<String> = Vec::new();
+            let mut rows = Vec::new();
+
+            for value in values {
+                if let Some(row_map) = value.as_str().and_then(parse_var_dumper_row) {
+                    for key in row_map.keys() {
+                        if !headers.iter().any(|existing| existing == key) {
+                            headers.push(key.clone());
+                        }
+                    }
+                    rows.push(row_map);
+                }
+            }
+
+            if !rows.is_empty() && !headers.is_empty() {
+                let row_cells = rows
+                    .into_iter()
+                    .map(|row| {
+                        headers
+                            .iter()
+                            .map(|header| row.get(header).cloned().unwrap_or_default())
+                            .collect()
+                    })
+                    .collect();
+
+                return Some(Self {
+                    headers,
+                    rows: row_cells,
+                });
+            }
+        }
+
         let headers = vec!["value".to_string()];
         let rows = values
             .iter()
@@ -577,7 +610,10 @@ impl TableModel {
 
         let headers: Vec<String> = TH_RE
             .captures_iter(table_segment)
-            .map(|cap| clean_html_text(cap.get(1).map(|m| m.as_str()).unwrap_or("")))
+            .map(|cap| {
+                let raw = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                clean_html_text(raw)
+            })
             .collect();
 
         if headers.is_empty() {
@@ -589,7 +625,10 @@ impl TableModel {
             let row_html = row_cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let cells: Vec<String> = TD_RE
                 .captures_iter(row_html)
-                .map(|cap| clean_html_text(cap.get(1).map(|m| m.as_str()).unwrap_or("")))
+                .map(|cap| {
+                    let raw = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    clean_html_text(raw)
+                })
                 .collect();
             if !cells.is_empty() {
                 rows.push(cells);
@@ -637,7 +676,7 @@ impl TableModel {
 
 fn format_table_value(value: &Value) -> String {
     match value {
-        Value::String(text) => truncate(text, 80),
+        Value::String(text) => clean_html_text(text),
         Value::Bool(boolean) => boolean.to_string(),
         Value::Number(number) => number.to_string(),
         Value::Null => "null".to_string(),
@@ -682,10 +721,54 @@ fn format_row(cells: &[String], widths: &[usize]) -> String {
 }
 
 fn clean_html_text(input: &str) -> String {
-    let without_script = SCRIPT_RE.replace_all(input, "");
-    let stripped = TAG_RE.replace_all(&without_script, "");
-    let decoded = decode_html_entities(stripped.trim()).into_owned();
-    truncate(&decoded, 80)
+    let stripped = strip_html(input);
+    truncate(&stripped, 80)
+}
+
+fn strip_html(input: &str) -> String {
+    let mut text = input.replace("<br>", "\n").replace("<br />", "\n");
+    text = SCRIPT_RE.replace_all(&text, "").into_owned();
+    let stripped = TAG_RE.replace_all(&text, "");
+    decode_html_entities(stripped.trim()).into_owned()
+}
+
+fn parse_var_dumper_row(input: &str) -> Option<BTreeMap<String, String>> {
+    let stripped = strip_html(input);
+    let mut map = BTreeMap::new();
+
+    for line in stripped.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "["
+            || trimmed == "]"
+            || trimmed.ends_with('[')
+            || trimmed.starts_with('[')
+        {
+            continue;
+        }
+
+        if let Some((key_part, value_part)) = trimmed.split_once("=>") {
+            let key = key_part
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+            let value_raw = value_part.trim().trim_matches(',');
+
+            if value_raw.ends_with('[') {
+                continue;
+            }
+
+            if key.chars().all(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+
+            let value_clean = value_raw
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                .to_string();
+            map.insert(key.to_string(), value_clean);
+        }
+    }
+
+    if map.is_empty() { None } else { Some(map) }
 }
 
 #[cfg(test)]
