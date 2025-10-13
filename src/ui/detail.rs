@@ -104,19 +104,34 @@ fn payload_label(payload: &Payload) -> String {
     match payload.kind {
         PayloadKind::Log => "log".to_string(),
         PayloadKind::Custom => {
-            let has_html_label = payload
+            let content = payload
+                .content_object()
+                .and_then(|map| map.get("content"))
+                .and_then(|value| value.as_str());
+
+            let raw_label = payload
                 .content_string("label")
+                .map(|label| label.trim())
+                .filter(|label| !label.is_empty());
+
+            let has_image_label = raw_label
+                .map(|label| label.eq_ignore_ascii_case("image"))
+                .unwrap_or(false);
+            let looks_image = content.map(contains_image_tag).unwrap_or(false);
+
+            if has_image_label || looks_image {
+                return "image".to_string();
+            }
+
+            let has_html_label = raw_label
                 .map(|label| label.eq_ignore_ascii_case("html"))
                 .unwrap_or(false)
-                || payload
-                    .content_object()
-                    .and_then(|map| map.get("content"))
-                    .and_then(|value| value.as_str())
-                    .map(looks_like_html)
-                    .unwrap_or(false);
+                || content.map(looks_like_html).unwrap_or(false);
 
             if has_html_label {
                 "html".to_string()
+            } else if let Some(label) = raw_label {
+                label.to_string()
             } else {
                 "custom".to_string()
             }
@@ -207,6 +222,15 @@ fn render_custom(payload: &Payload) -> Vec<DetailLine> {
                 .and_then(|value| value.as_str())
                 .map(str::trim)
                 .filter(|label| !label.is_empty());
+
+            let is_default_image_label = raw_label
+                .map(|label| label.eq_ignore_ascii_case("image"))
+                .unwrap_or(false);
+
+            if is_default_image_label || contains_image_tag(content) {
+                let src = extract_image_src(content).unwrap_or_else(|| content.trim());
+                return vec![parse_plain_line(src)];
+            }
 
             let is_default_html_label = raw_label
                 .map(|label| label.eq_ignore_ascii_case("html"))
@@ -601,6 +625,8 @@ static TD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<td[^>]*>(.*?)</td>")
 static SCRIPT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
 static TAG_GAP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r">\s*<").unwrap());
+static IMG_SRC_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r##"(?is)<img[^>]*src\s*=\s*['"]([^'"]+)['"]"##).unwrap());
 
 fn compute_has_children(lines: &[DetailLine]) -> Vec<bool> {
     let mut result = vec![false; lines.len()];
@@ -881,6 +907,17 @@ fn parse_html_segments(line: &str) -> Vec<DetailSegment> {
 fn looks_like_html(input: &str) -> bool {
     let trimmed = input.trim();
     trimmed.starts_with('<') && trimmed.contains('>')
+}
+
+fn contains_image_tag(html: &str) -> bool {
+    IMG_SRC_RE.is_match(html)
+}
+
+fn extract_image_src(html: &str) -> Option<&str> {
+    IMG_SRC_RE
+        .captures(html)
+        .and_then(|capture| capture.get(1))
+        .map(|m| m.as_str())
 }
 
 fn display_width(text: &str) -> usize {

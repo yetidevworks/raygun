@@ -882,6 +882,8 @@ fn build_detail_view_for_event(event: &TimelineEvent) -> detail::DetailViewModel
 static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static HTML_SCRIPT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
+static HTML_IMG_SRC_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r##"(?is)<img[^>]*src\s*=\s*['"]([^'"]+)['"]"##).unwrap());
 
 fn is_default_html_label(label: &str) -> bool {
     label.trim().eq_ignore_ascii_case("html")
@@ -890,6 +892,17 @@ fn is_default_html_label(label: &str) -> bool {
 fn looks_like_html_snippet(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with('<') && trimmed.contains('>')
+}
+
+fn contains_image_tag(html: &str) -> bool {
+    HTML_IMG_SRC_RE.is_match(html)
+}
+
+fn extract_image_src(html: &str) -> Option<&str> {
+    HTML_IMG_SRC_RE
+        .captures(html)
+        .and_then(|capture| capture.get(1))
+        .map(|m| m.as_str())
 }
 
 fn strip_html_tags(text: &str) -> String {
@@ -1112,25 +1125,32 @@ fn payload_summary(payload: &Payload) -> String {
 }
 
 fn custom_payload_type(payload: &Payload) -> Option<String> {
-    if let Some(label) = payload
+    let raw_label = payload
         .content_string("label")
         .map(|label| label.trim())
-        .filter(|label| !label.is_empty())
-    {
+        .filter(|label| !label.is_empty());
+
+    if let Some(label) = raw_label {
+        if label.eq_ignore_ascii_case("image") {
+            return Some("image".to_string());
+        }
         if is_default_html_label(label) {
             return Some("html".to_string());
         }
         return Some(label.to_string());
     }
 
-    if payload
+    if let Some(content) = payload
         .content_object()
         .and_then(|map| map.get("content"))
         .and_then(|value| value.as_str())
-        .map(looks_like_html_snippet)
-        .unwrap_or(false)
     {
-        return Some("html".to_string());
+        if contains_image_tag(content) {
+            return Some("image".to_string());
+        }
+        if looks_like_html_snippet(content) {
+            return Some("html".to_string());
+        }
     }
 
     None
@@ -1139,9 +1159,18 @@ fn custom_payload_type(payload: &Payload) -> Option<String> {
 fn summarize_custom(payload: &Payload) -> String {
     let type_hint = custom_payload_type(payload);
 
-    let body = payload
-        .content_object()
-        .and_then(|map| map.get("content"))
+    let content_value = payload.content_object().and_then(|map| map.get("content"));
+
+    if type_hint.as_deref() == Some("image") {
+        let src = content_value
+            .and_then(|value| value.as_str())
+            .and_then(extract_image_src)
+            .or_else(|| content_value.and_then(|value| value.as_str()))
+            .unwrap_or("image payload");
+        return clip(&format!("image: {}", src), 80);
+    }
+
+    let body = content_value
         .map(|value| match (value, type_hint.as_deref()) {
             (Value::String(text), Some("html")) => strip_html_tags(text),
             (other, _) => value_preview(other),
