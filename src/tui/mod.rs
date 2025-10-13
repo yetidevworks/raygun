@@ -201,6 +201,11 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
 
     frame.render_widget(block, area);
 
+    let inner_area = inner(area);
+    if inner_area.height == 0 {
+        return;
+    }
+
     if view_model.timeline.is_empty() {
         let content = Paragraph::new(format!(
             "Waiting for Ray payloads…\n\nUse the PHP `ray()` helper to send data here.\nListening on {}.\nPress `q` to exit.",
@@ -209,15 +214,21 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::Gray));
 
-        frame.render_widget(content, inner(area));
+        frame.render_widget(content, inner_area);
         return;
     }
 
-    let items: Vec<ListItem> = view_model
-        .timeline
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| {
+    let view_height = inner_area.height as usize;
+    let selected = view_model.selected.unwrap_or(0);
+    let total = view_model.timeline.len();
+    let max_start = total.saturating_sub(view_height);
+    let start = selected
+        .saturating_sub(view_height.saturating_sub(1))
+        .min(max_start);
+
+    let mut items = Vec::new();
+    for idx in start..(start + view_height).min(total) {
+        if let Some(entry) = view_model.timeline.get(idx) {
             let text = format!("[{}] {} · {}", entry.kind, entry.summary, entry.age);
             let base = Style::default().fg(Color::Gray);
             let style = if Some(idx) == view_model.selected {
@@ -225,12 +236,12 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
             } else {
                 base
             };
-            ListItem::new(text).style(style)
-        })
-        .collect();
+            items.push(ListItem::new(text).style(style));
+        }
+    }
 
     let list = List::new(items).block(Block::default());
-    frame.render_widget(list, inner(area));
+    frame.render_widget(list, inner_area);
 }
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
