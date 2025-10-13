@@ -92,6 +92,10 @@ impl AppState {
         let mut inner = self.inner.write().await;
         let outcome = inner.apply_payloads(&mut event);
 
+        if matches!(outcome, ApplyOutcome::Record) {
+            inner.merge_previous_log_into_trace(&mut event);
+        }
+
         if matches!(outcome, ApplyOutcome::Skip) {
             return None;
         }
@@ -329,6 +333,51 @@ impl StateInner {
 
         outcome
     }
+
+    fn merge_previous_log_into_trace(&mut self, event: &mut TimelineEvent) {
+        if !event
+            .request
+            .payloads
+            .iter()
+            .any(|payload| matches!(payload.kind, PayloadKind::Trace))
+        {
+            return;
+        }
+
+        let last_message = self.timeline.back().and_then(extract_single_log_message);
+
+        if let Some(message) = last_message {
+            self.timeline.pop_back();
+            if event.label.is_none() {
+                event.label = Some(message);
+            }
+        }
+    }
+}
+
+fn extract_single_log_message(event: &TimelineEvent) -> Option<String> {
+    if event.request.payloads.len() != 1 {
+        return None;
+    }
+
+    let payload = event.request.payloads.first()?;
+    if !matches!(payload.kind, PayloadKind::Log) {
+        return None;
+    }
+
+    payload
+        .content_object()
+        .and_then(|map| map.get("values"))
+        .and_then(|value| value.as_array())
+        .and_then(|values| {
+            values.iter().find_map(|value| {
+                value
+                    .as_str()
+                    .map(|text| text.trim())
+                    .filter(|text| !text.is_empty())
+                    .map(|text| text.to_string())
+            })
+        })
 }
 
 fn sanitize_screen_name(raw: &str) -> String {

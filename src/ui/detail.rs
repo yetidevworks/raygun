@@ -61,6 +61,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         PayloadKind::Table => render_table(payload),
         PayloadKind::Custom => render_custom(payload),
         PayloadKind::Label => render_label(payload),
+        PayloadKind::Trace => render_trace(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
         _ => fallback_lines(payload),
     };
@@ -258,6 +259,123 @@ fn render_label(payload: &Payload) -> Vec<DetailLine> {
         .unwrap_or("label payload");
 
     vec![parse_plain_line(label)]
+}
+
+fn render_trace(payload: &Payload) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+
+    if let Some(label) = payload
+        .content_string("label")
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        lines.push(parse_plain_line(&format!("Label: {}", label)));
+        lines.push(parse_plain_line(""));
+    }
+
+    let frames = payload
+        .content_object()
+        .and_then(|map| map.get("frames"))
+        .and_then(|value| value.as_array());
+
+    let frames = match frames {
+        Some(frames) if !frames.is_empty() => frames,
+        _ => {
+            lines.push(parse_plain_line("(no frames)"));
+            return lines;
+        }
+    };
+
+    for (index, frame) in frames.iter().enumerate() {
+        let class = frame
+            .get("class")
+            .and_then(|value| value.as_str())
+            .unwrap_or("(anonymous)")
+            .trim();
+        let method = frame
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
+
+        let file = frame
+            .get("file_name")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let line_number = frame
+            .get("line_number")
+            .and_then(|value| value.as_i64())
+            .map(|number| number.to_string());
+
+        let vendor = frame
+            .get("vendor_frame")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        let mut header_segments = Vec::new();
+        header_segments.push(DetailSegment {
+            text: format!("#{:<2} ", index + 1),
+            style: SegmentStyle::Plain,
+        });
+        header_segments.push(DetailSegment {
+            text: class.to_string(),
+            style: SegmentStyle::Key,
+        });
+        if !method.is_empty() {
+            header_segments.push(DetailSegment {
+                text: "::".to_string(),
+                style: SegmentStyle::Plain,
+            });
+            header_segments.push(DetailSegment {
+                text: method.to_string(),
+                style: SegmentStyle::Type,
+            });
+        }
+        if vendor {
+            header_segments.push(DetailSegment {
+                text: " [vendor]".to_string(),
+                style: SegmentStyle::Boolean,
+            });
+        }
+        lines.push(DetailLine {
+            indent: 0,
+            segments: header_segments,
+        });
+
+        if let Some(file) = file {
+            let mut location_segments = Vec::new();
+            location_segments.push(DetailSegment {
+                text: file.to_string(),
+                style: SegmentStyle::String,
+            });
+            if let Some(line_number) = line_number {
+                location_segments.push(DetailSegment {
+                    text: ":".to_string(),
+                    style: SegmentStyle::Plain,
+                });
+                location_segments.push(DetailSegment {
+                    text: line_number,
+                    style: SegmentStyle::Number,
+                });
+            }
+            lines.push(DetailLine {
+                indent: 1,
+                segments: location_segments,
+            });
+        }
+
+        lines.push(parse_plain_line(""));
+    }
+
+    if let Some(last) = lines.last() {
+        if last.segments.len() == 1 && last.segments[0].text.is_empty() {
+            // remove trailing blank line
+            lines.pop();
+        }
+    }
+
+    lines
 }
 
 fn render_html(label: Option<&str>, html: &str) -> Vec<DetailLine> {
