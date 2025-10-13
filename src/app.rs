@@ -916,6 +916,7 @@ fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
 
     let mut values: Vec<Value> = Vec::new();
     let mut label: Option<String> = None;
+    let mut meta_snapshot: Option<Value> = None;
     let mut origin_snapshot: Option<&Origin> = None;
 
     for payload in &event.request.payloads {
@@ -940,6 +941,12 @@ fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
                             if !is_default_html_label(found) {
                                 label = Some(found.to_string());
                             }
+                        }
+                    }
+
+                    if meta_snapshot.is_none() {
+                        if let Some(meta) = object.get("meta") {
+                            meta_snapshot = Some(meta.clone());
                         }
                     }
                 }
@@ -978,6 +985,10 @@ fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
     content.insert("values".to_string(), Value::Array(values));
     if let Some(label_value) = label.clone().filter(|label| !is_default_html_label(label)) {
         content.insert("label".to_string(), Value::String(label_value));
+    }
+
+    if let Some(meta) = meta_snapshot {
+        content.insert("meta".to_string(), meta);
     }
 
     let mut root = Map::new();

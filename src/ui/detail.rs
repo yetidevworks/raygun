@@ -1202,4 +1202,35 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("Name")));
         assert!(rendered.iter().any(|line| line.contains("Alice")));
     }
+
+    #[test]
+    fn renders_log_prefers_clipboard_data_over_script() {
+        let payload_json = r#"
+        {
+            "type": "log",
+            "content": {
+                "meta": [{
+                    "clipboard_data": "[\\n    0 => [    \\n        'id' => 1001,\\n        'status' => 'pending',\\n        'total' => 49.5,\\n    ],\\n    1 => [    \\n        'id' => 1002,\\n        'status' => 'paid',\\n        'total' => 125,\\n    ],\\n]"
+                }],
+                "values": ["<script> SfDump = window.SfDump || (function (doc) { doc.documentElement.classList.add('sf-js-enabled'); });</script>"]
+            }
+        }
+        "#;
+
+        let payload: Payload =
+            serde_json::from_str(payload_json).expect("payload should deserialize");
+        let lines = render_log(&payload);
+        assert!(!lines.is_empty());
+        let joined = lines
+            .iter()
+            .map(|line| line.segments[0].text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("'id' => 1001"),
+            "unexpected log output: {}",
+            joined
+        );
+        assert!(!joined.contains("sf-dump"), "script leak: {}", joined);
+    }
 }
