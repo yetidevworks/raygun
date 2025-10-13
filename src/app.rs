@@ -994,38 +994,36 @@ fn is_primary_payload_kind(kind: &PayloadKind) -> bool {
 
 fn payload_kind_label(payload: &Payload) -> String {
     match &payload.kind {
-        PayloadKind::Log => "log",
-        PayloadKind::Custom => custom_payload_type(payload).unwrap_or_else(|| "custom".to_string())
-            .as_str(),
-        PayloadKind::CreateLock => "create_lock",
-        PayloadKind::ClearAll => "clear_all",
-        PayloadKind::Hide => "hide",
-        PayloadKind::ShowApp => "show_app",
-        PayloadKind::ShowBrowser => "show_browser",
-        PayloadKind::Notify => "notify",
-        PayloadKind::Separator => "separator",
-        PayloadKind::Exception => "exception",
-        PayloadKind::Table => "table",
-        PayloadKind::Text => "text",
-        PayloadKind::Image => "image",
-        PayloadKind::JsonString => "json_string",
-        PayloadKind::DecodedJson => "decoded_json",
-        PayloadKind::Boolean => "boolean",
-        PayloadKind::Size => "size",
-        PayloadKind::Color => "color",
-        PayloadKind::Label => "label",
-        PayloadKind::Trace => "trace",
-        PayloadKind::Caller => "caller",
-        PayloadKind::Measure => "measure",
-        PayloadKind::PhpInfo => "phpinfo",
-        PayloadKind::NewScreen => "new_screen",
-        PayloadKind::Remove => "remove",
-        PayloadKind::HideApp => "hide_app",
-        PayloadKind::Ban => "ban",
-        PayloadKind::Charles => "charles",
-        PayloadKind::Unknown(value) => value.as_str(),
+        PayloadKind::Log => "log".to_string(),
+        PayloadKind::Custom => custom_payload_type(payload).unwrap_or_else(|| "custom".to_string()),
+        PayloadKind::CreateLock => "create_lock".to_string(),
+        PayloadKind::ClearAll => "clear_all".to_string(),
+        PayloadKind::Hide => "hide".to_string(),
+        PayloadKind::ShowApp => "show_app".to_string(),
+        PayloadKind::ShowBrowser => "show_browser".to_string(),
+        PayloadKind::Notify => "notify".to_string(),
+        PayloadKind::Separator => "separator".to_string(),
+        PayloadKind::Exception => "exception".to_string(),
+        PayloadKind::Table => "table".to_string(),
+        PayloadKind::Text => "text".to_string(),
+        PayloadKind::Image => "image".to_string(),
+        PayloadKind::JsonString => "json_string".to_string(),
+        PayloadKind::DecodedJson => "decoded_json".to_string(),
+        PayloadKind::Boolean => "boolean".to_string(),
+        PayloadKind::Size => "size".to_string(),
+        PayloadKind::Color => "color".to_string(),
+        PayloadKind::Label => "label".to_string(),
+        PayloadKind::Trace => "trace".to_string(),
+        PayloadKind::Caller => "caller".to_string(),
+        PayloadKind::Measure => "measure".to_string(),
+        PayloadKind::PhpInfo => "phpinfo".to_string(),
+        PayloadKind::NewScreen => "new_screen".to_string(),
+        PayloadKind::Remove => "remove".to_string(),
+        PayloadKind::HideApp => "hide_app".to_string(),
+        PayloadKind::Ban => "ban".to_string(),
+        PayloadKind::Charles => "charles".to_string(),
+        PayloadKind::Unknown(value) => value.as_str().to_string(),
     }
-    .to_string()
 }
 
 fn payload_summary(payload: &Payload) -> String {
@@ -1110,6 +1108,50 @@ fn payload_summary(payload: &Payload) -> String {
         PayloadKind::Ban => "ban".to_string(),
         PayloadKind::Charles => "charles".to_string(),
         PayloadKind::Unknown(name) => format!("{} payload", name),
+    }
+}
+
+fn custom_payload_type(payload: &Payload) -> Option<String> {
+    if let Some(label) = payload
+        .content_string("label")
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        if is_default_html_label(label) {
+            return Some("html".to_string());
+        }
+        return Some(label.to_string());
+    }
+
+    if payload
+        .content_object()
+        .and_then(|map| map.get("content"))
+        .and_then(|value| value.as_str())
+        .map(looks_like_html_snippet)
+        .unwrap_or(false)
+    {
+        return Some("html".to_string());
+    }
+
+    None
+}
+
+fn summarize_custom(payload: &Payload) -> String {
+    let type_hint = custom_payload_type(payload);
+
+    let body = payload
+        .content_object()
+        .and_then(|map| map.get("content"))
+        .map(|value| match (value, type_hint.as_deref()) {
+            (Value::String(text), Some("html")) => strip_html_tags(text),
+            (other, _) => value_preview(other),
+        })
+        .unwrap_or_else(|| "custom payload".to_string());
+
+    match type_hint.as_deref() {
+        Some("html") => clip(&body, 80),
+        Some(other) => clip(&format!("{}: {}", other, body), 80),
+        None => clip(&body, 80),
     }
 }
 
