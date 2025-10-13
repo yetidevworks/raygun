@@ -12,6 +12,8 @@ use color_eyre::{
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use html_escape::decode_html_entities;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{Number, Value};
 use tokio::{select, sync::mpsc};
 use tracing::{debug, info, warn};
@@ -819,10 +821,18 @@ fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
                 .filter(|label| !label.is_empty());
         }
 
-        (payload_kind_label(&payload.kind), payload_summary(payload))
+        (payload_kind_label(payload), payload_summary(payload))
     } else {
         ("empty".to_string(), "Request without payloads".to_string())
     };
+
+    if timeline_label
+        .as_deref()
+        .map(is_default_html_label)
+        .unwrap_or(false)
+    {
+        timeline_label = None;
+    }
 
     if let Some(screen) = event.screen.as_deref() {
         summary = format!("{} | {}", screen, summary);
@@ -869,6 +879,25 @@ fn build_detail_view_for_event(event: &TimelineEvent) -> detail::DetailViewModel
     }
 }
 
+static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
+static HTML_SCRIPT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
+
+fn is_default_html_label(label: &str) -> bool {
+    label.trim().eq_ignore_ascii_case("html")
+}
+
+fn looks_like_html_snippet(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('<') && trimmed.contains('>')
+}
+
+fn strip_html_tags(text: &str) -> String {
+    let without_script = HTML_SCRIPT_RE.replace_all(text, "");
+    let stripped = HTML_TAG_RE.replace_all(&without_script, " ").into_owned();
+    flatten(stripped.trim())
+}
+
 fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
     use serde_json::Map;
 
@@ -895,7 +924,9 @@ fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
                             .map(|text| text.trim())
                             .filter(|text| !text.is_empty())
                         {
-                            label = Some(found.to_string());
+                            if !is_default_html_label(found) {
+                                label = Some(found.to_string());
+                            }
                         }
                     }
                 }
@@ -907,15 +938,12 @@ fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
                         .and_then(|map| map.get("label"))
                         .and_then(|value| value.as_str())
                         .map(|text| text.trim().to_string())
-                        .filter(|text| !text.is_empty());
+                        .filter(|text| !text.is_empty())
+                        .filter(|text| !is_default_html_label(text));
                 }
             }
             _ => {}
         }
-    }
-
-    if label.is_none() {
-        label = event.label.clone();
     }
 
     if values.is_empty() && label.is_none() {
@@ -929,12 +957,13 @@ fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
             .iter()
             .find_map(|payload| payload.content_string("label"))
             .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty());
+            .filter(|text| !text.is_empty())
+            .filter(|text| !is_default_html_label(text));
     }
 
     let mut content = Map::new();
     content.insert("values".to_string(), Value::Array(values));
-    if let Some(label_value) = label {
+    if let Some(label_value) = label.clone().filter(|label| !is_default_html_label(label)) {
         content.insert("label".to_string(), Value::String(label_value));
     }
 
@@ -963,10 +992,11 @@ fn is_primary_payload_kind(kind: &PayloadKind) -> bool {
     !matches!(kind, PayloadKind::Color | PayloadKind::Label)
 }
 
-fn payload_kind_label(kind: &PayloadKind) -> String {
-    match kind {
+fn payload_kind_label(payload: &Payload) -> String {
+    match &payload.kind {
         PayloadKind::Log => "log",
-        PayloadKind::Custom => "custom",
+        PayloadKind::Custom => custom_payload_type(payload).unwrap_or_else(|| "custom".to_string())
+            .as_str(),
         PayloadKind::CreateLock => "create_lock",
         PayloadKind::ClearAll => "clear_all",
         PayloadKind::Hide => "hide",
@@ -1001,7 +1031,8 @@ fn payload_kind_label(kind: &PayloadKind) -> String {
 fn payload_summary(payload: &Payload) -> String {
     match &payload.kind {
         PayloadKind::Log => summarize_log(payload).unwrap_or_else(|| "log payload".to_string()),
-        PayloadKind::Custom | PayloadKind::Boolean => {
+        PayloadKind::Custom => summarize_custom(payload),
+        PayloadKind::Boolean => {
             let label = payload.content_string("label");
             let body = payload
                 .content_object()

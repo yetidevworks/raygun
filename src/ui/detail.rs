@@ -41,7 +41,7 @@ pub enum SegmentStyle {
 pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailViewModel {
     let header = format!(
         "{} • {}",
-        payload_label(&payload.kind),
+        payload_label(payload),
         humanize_timestamp(received_at)
     );
 
@@ -59,6 +59,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         PayloadKind::Log => render_log(payload),
         PayloadKind::Text => render_text(payload),
         PayloadKind::Table => render_table(payload),
+        PayloadKind::Custom => render_custom(payload),
         PayloadKind::Label => render_label(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
         _ => fallback_lines(payload),
@@ -99,37 +100,54 @@ pub fn visible_indices_with_children(
     (visible, has_children)
 }
 
-fn payload_label(kind: &PayloadKind) -> &'static str {
-    match kind {
-        PayloadKind::Log => "log",
-        PayloadKind::Custom => "custom",
-        PayloadKind::CreateLock => "create_lock",
-        PayloadKind::ClearAll => "clear_all",
-        PayloadKind::Hide => "hide",
-        PayloadKind::ShowApp => "show_app",
-        PayloadKind::ShowBrowser => "show_browser",
-        PayloadKind::Notify => "notify",
-        PayloadKind::Separator => "separator",
-        PayloadKind::Exception => "exception",
-        PayloadKind::Table => "table",
-        PayloadKind::Text => "text",
-        PayloadKind::Image => "image",
-        PayloadKind::JsonString => "json_string",
-        PayloadKind::DecodedJson => "decoded_json",
-        PayloadKind::Boolean => "boolean",
-        PayloadKind::Size => "size",
-        PayloadKind::Color => "color",
-        PayloadKind::Label => "label",
-        PayloadKind::Trace => "trace",
-        PayloadKind::Caller => "caller",
-        PayloadKind::Measure => "measure",
-        PayloadKind::PhpInfo => "phpinfo",
-        PayloadKind::NewScreen => "new_screen",
-        PayloadKind::Remove => "remove",
-        PayloadKind::HideApp => "hide_app",
-        PayloadKind::Ban => "ban",
-        PayloadKind::Charles => "charles",
-        PayloadKind::Unknown(_) => "unknown",
+fn payload_label(payload: &Payload) -> String {
+    match payload.kind {
+        PayloadKind::Log => "log".to_string(),
+        PayloadKind::Custom => {
+            let has_html_label = payload
+                .content_string("label")
+                .map(|label| label.eq_ignore_ascii_case("html"))
+                .unwrap_or(false)
+                || payload
+                    .content_object()
+                    .and_then(|map| map.get("content"))
+                    .and_then(|value| value.as_str())
+                    .map(looks_like_html)
+                    .unwrap_or(false);
+
+            if has_html_label {
+                "html".to_string()
+            } else {
+                "custom".to_string()
+            }
+        }
+        PayloadKind::CreateLock => "create_lock".to_string(),
+        PayloadKind::ClearAll => "clear_all".to_string(),
+        PayloadKind::Hide => "hide".to_string(),
+        PayloadKind::ShowApp => "show_app".to_string(),
+        PayloadKind::ShowBrowser => "show_browser".to_string(),
+        PayloadKind::Notify => "notify".to_string(),
+        PayloadKind::Separator => "separator".to_string(),
+        PayloadKind::Exception => "exception".to_string(),
+        PayloadKind::Table => "table".to_string(),
+        PayloadKind::Text => "text".to_string(),
+        PayloadKind::Image => "image".to_string(),
+        PayloadKind::JsonString => "json_string".to_string(),
+        PayloadKind::DecodedJson => "decoded_json".to_string(),
+        PayloadKind::Boolean => "boolean".to_string(),
+        PayloadKind::Size => "size".to_string(),
+        PayloadKind::Color => "color".to_string(),
+        PayloadKind::Label => "label".to_string(),
+        PayloadKind::Trace => "trace".to_string(),
+        PayloadKind::Caller => "caller".to_string(),
+        PayloadKind::Measure => "measure".to_string(),
+        PayloadKind::PhpInfo => "phpinfo".to_string(),
+        PayloadKind::NewScreen => "new_screen".to_string(),
+        PayloadKind::Remove => "remove".to_string(),
+        PayloadKind::HideApp => "hide_app".to_string(),
+        PayloadKind::Ban => "ban".to_string(),
+        PayloadKind::Charles => "charles".to_string(),
+        PayloadKind::Unknown(_) => "unknown".to_string(),
     }
 }
 
@@ -181,6 +199,33 @@ fn render_text(payload: &Payload) -> Vec<DetailLine> {
         .unwrap_or_else(|| fallback_lines(payload))
 }
 
+fn render_custom(payload: &Payload) -> Vec<DetailLine> {
+    if let Some(object) = payload.content_object() {
+        if let Some(content) = object.get("content").and_then(|value| value.as_str()) {
+            let raw_label = object
+                .get("label")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|label| !label.is_empty());
+
+            let is_default_html_label = raw_label
+                .map(|label| label.eq_ignore_ascii_case("html"))
+                .unwrap_or(false);
+
+            if looks_like_html(content) || is_default_html_label {
+                let label = if is_default_html_label {
+                    None
+                } else {
+                    raw_label
+                };
+                return render_html(label, content);
+            }
+        }
+    }
+
+    fallback_lines(payload)
+}
+
 fn render_label(payload: &Payload) -> Vec<DetailLine> {
     let label = payload
         .content_string("label")
@@ -189,6 +234,51 @@ fn render_label(payload: &Payload) -> Vec<DetailLine> {
         .unwrap_or("label payload");
 
     vec![parse_plain_line(label)]
+}
+
+fn render_html(label: Option<&str>, html: &str) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+
+    if let Some(label) = label {
+        if label.eq_ignore_ascii_case("html") {
+            // implied default label, skip showing a label line
+        } else {
+            lines.push(parse_plain_line(&format!("Label: {}", label)));
+            lines.push(parse_plain_line(""));
+        }
+    }
+
+    let normalized = TAG_GAP_RE.replace_all(html, ">\n<");
+    let mut indent = 0usize;
+
+    for raw_line in normalized.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with("</") {
+            indent = indent.saturating_sub(1);
+        }
+
+        let segments = parse_html_segments(trimmed);
+        lines.push(DetailLine { indent, segments });
+
+        if trimmed.starts_with("<")
+            && !trimmed.starts_with("</")
+            && !trimmed.ends_with("/>")
+            && !trimmed.starts_with("<!")
+            && !trimmed.starts_with("<?")
+        {
+            indent = indent.saturating_add(1);
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(parse_plain_line(html));
+    }
+
+    lines
 }
 
 fn render_json(payload: &Payload) -> Vec<DetailLine> {
@@ -510,6 +600,7 @@ static TH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<th[^>]*>(.*?)</th>")
 static TD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<td[^>]*>(.*?)</td>").unwrap());
 static SCRIPT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
+static TAG_GAP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r">\s*<").unwrap());
 
 fn compute_has_children(lines: &[DetailLine]) -> Vec<bool> {
     let mut result = vec![false; lines.len()];
@@ -739,6 +830,57 @@ fn value_to_plain(value: &Value) -> String {
         Value::Array(array) => format!("[array {}]", array.len()),
         Value::Object(object) => format!("{{object {} keys}}", object.len()),
     }
+}
+
+fn parse_html_segments(line: &str) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    let mut rest = line;
+
+    while !rest.is_empty() {
+        if let Some(pos) = rest.find('<') {
+            if pos > 0 {
+                let (text, tail) = rest.split_at(pos);
+                if !text.is_empty() {
+                    segments.push(DetailSegment {
+                        text: text.to_string(),
+                        style: SegmentStyle::String,
+                    });
+                }
+                rest = tail;
+                continue;
+            }
+
+            if let Some(end) = rest.find('>') {
+                let (tag, tail) = rest.split_at(end + 1);
+                segments.push(DetailSegment {
+                    text: tag.to_string(),
+                    style: SegmentStyle::Type,
+                });
+                rest = tail;
+                continue;
+            }
+        }
+
+        segments.push(DetailSegment {
+            text: rest.to_string(),
+            style: SegmentStyle::String,
+        });
+        break;
+    }
+
+    if segments.is_empty() {
+        segments.push(DetailSegment {
+            text: line.to_string(),
+            style: SegmentStyle::String,
+        });
+    }
+
+    segments
+}
+
+fn looks_like_html(input: &str) -> bool {
+    let trimmed = input.trim();
+    trimmed.starts_with('<') && trimmed.contains('>')
 }
 
 fn display_width(text: &str) -> usize {
