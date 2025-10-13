@@ -1,10 +1,16 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    path::PathBuf,
     sync::Arc,
     time::SystemTime,
 };
 
-use tokio::sync::RwLock;
+use tokio::{
+    fs::OpenOptions,
+    io::AsyncWriteExt,
+    sync::{RwLock, mpsc},
+};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::protocol::{PayloadKind, RayRequest};
@@ -18,6 +24,7 @@ pub struct TimelineEvent {
     pub request: Arc<RayRequest>,
     pub screen: Option<String>,
     pub color: Option<String>,
+    pub label: Option<String>,
 }
 
 impl TimelineEvent {
@@ -28,6 +35,7 @@ impl TimelineEvent {
             request: Arc::new(request),
             screen,
             color: None,
+            label: None,
         }
     }
 }
@@ -51,19 +59,29 @@ impl LockRecord {
 pub struct AppState {
     retention: usize,
     inner: RwLock<StateInner>,
+    debug_logger: Option<Arc<PayloadLogger>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new(DEFAULT_RETENTION)
+        Self::with_logger(None)
     }
 }
 
 impl AppState {
     pub fn new(retention: usize) -> Self {
+        Self::with_debug_logger(retention, None)
+    }
+
+    pub fn with_logger(debug_logger: Option<Arc<PayloadLogger>>) -> Self {
+        Self::with_debug_logger(DEFAULT_RETENTION, debug_logger)
+    }
+
+    pub fn with_debug_logger(retention: usize, debug_logger: Option<Arc<PayloadLogger>>) -> Self {
         Self {
             retention,
             inner: RwLock::new(StateInner::default()),
+            debug_logger,
         }
     }
 
@@ -86,6 +104,15 @@ impl AppState {
         inner.timeline.push_back(stored_event.clone());
         if inner.timeline.len() > self.retention {
             inner.timeline.pop_front();
+        }
+
+        let logger = self.debug_logger.clone();
+        let log_request = stored_event.request.clone();
+
+        drop(inner);
+
+        if let Some(logger) = logger {
+            logger.log(log_request);
         }
 
         Some(stored_event)
@@ -141,11 +168,56 @@ struct StateInner {
     current_screen: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct PayloadLogger {
+    sender: mpsc::UnboundedSender<Arc<RayRequest>>,
+}
+
+impl PayloadLogger {
+    pub fn new(path: PathBuf) -> Arc<Self> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let logger = Arc::new(Self { sender: tx });
+        let task_logger = Arc::clone(&logger);
+
+        tokio::spawn(async move {
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+            {
+                Ok(mut file) => {
+                    while let Some(request) = rx.recv().await {
+                        let dump = format!("{:#?}\n", request);
+                        if let Err(err) = file.write_all(dump.as_bytes()).await {
+                            warn!(?err, "failed to write payload dump");
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, "failed to open payload dump file");
+                    while rx.recv().await.is_some() {}
+                }
+            }
+
+            drop(task_logger);
+        });
+
+        logger
+    }
+
+    pub fn log(&self, request: Arc<RayRequest>) {
+        let _ = self.sender.send(request);
+    }
+}
+
 impl StateInner {
     fn apply_payloads(&mut self, event: &mut TimelineEvent) -> ApplyOutcome {
         let mut displayable = false;
         let mut outcome = ApplyOutcome::Record;
         let mut pending_color: Option<String> = None;
+        let mut pending_label: Option<String> = None;
 
         for payload in &event.request.payloads {
             match &payload.kind {
@@ -199,6 +271,13 @@ impl StateInner {
                         pending_color = Some(color_value);
                     }
                 }
+                PayloadKind::Label => {
+                    if let Some(value) = payload.content_string("label") {
+                        let label_value = value.to_owned();
+                        event.label = Some(label_value.clone());
+                        pending_label = Some(label_value);
+                    }
+                }
                 _ => {}
             }
 
@@ -234,6 +313,11 @@ impl StateInner {
             if let Some(color_value) = pending_color {
                 if let Some(last) = self.timeline.back_mut() {
                     last.color = Some(color_value);
+                }
+            }
+            if let Some(label_value) = pending_label {
+                if let Some(last) = self.timeline.back_mut() {
+                    last.label = Some(label_value);
                 }
             }
             outcome = ApplyOutcome::Skip;
@@ -528,5 +612,40 @@ mod tests {
             events.is_empty(),
             "timeline should be empty after manual clear"
         );
+    }
+
+    #[tokio::test]
+    async fn label_payload_updates_previous_event() {
+        let state = AppState::default();
+
+        let log_request = RayRequest {
+            uuid: "test-log".into(),
+            payloads: vec![make_payload(json!({
+                "type": "log",
+                "content": { "values": ["hello"], "meta": [] }
+            }))],
+            meta: BTreeMap::new(),
+        };
+
+        let event = state
+            .record_request(log_request)
+            .await
+            .expect("log should record");
+        assert!(event.label.is_none());
+
+        let label_request = RayRequest {
+            uuid: "test-log".into(),
+            payloads: vec![make_payload(json!({
+                "type": "label",
+                "content": { "label": "example" }
+            }))],
+            meta: BTreeMap::new(),
+        };
+
+        assert!(state.record_request(label_request).await.is_none());
+
+        let events = state.timeline_snapshot().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].label.as_deref(), Some("example"));
     }
 }

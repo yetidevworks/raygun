@@ -5,6 +5,8 @@ binary bundles an HTTP server and terminal UI in a single process.
 
 ```bash
 cargo run
+# or capture payloads while testing:
+cargo run -- --debug-dump payloads.log
 ```
 
 ## Bind Address
@@ -25,6 +27,6 @@ timeline list.
    layout presets. While on the details pane use `Enter`/`→` to expand, `←` to
    collapse, and `Space` to toggle. `Ctrl+K` clears the timeline, `Ctrl+D`
    toggles the raw payload viewer, `f` cycles the color filter, `?` opens the
-   help overlay, and you can quit with `q`, `Esc`, or `Ctrl+C`.
+   help overlay, and you can quit with `q` or `Ctrl+C`.
 3. If the port is already in use, Raygun fails to bind; choose another port via
    `--bind 127.0.0.1:23518` while testing.

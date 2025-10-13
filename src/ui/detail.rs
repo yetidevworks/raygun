@@ -59,6 +59,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         PayloadKind::Log => render_log(payload),
         PayloadKind::Text => render_text(payload),
         PayloadKind::Table => render_table(payload),
+        PayloadKind::Label => render_label(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
         _ => fallback_lines(payload),
     };
@@ -118,6 +119,7 @@ fn payload_label(kind: &PayloadKind) -> &'static str {
         PayloadKind::Boolean => "boolean",
         PayloadKind::Size => "size",
         PayloadKind::Color => "color",
+        PayloadKind::Label => "label",
         PayloadKind::Trace => "trace",
         PayloadKind::Caller => "caller",
         PayloadKind::Measure => "measure",
@@ -143,6 +145,32 @@ fn render_log(payload: &Payload) -> Vec<DetailLine> {
         return parse_sf_dump(clipboard);
     }
 
+    if let Some(values) = payload
+        .content_object()
+        .and_then(|map| map.get("values"))
+        .and_then(|value| value.as_array())
+    {
+        let mut lines = Vec::new();
+
+        if let Some(label) = payload
+            .content_string("label")
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+        {
+            lines.push(parse_plain_line(&format!("Label: {}", label)));
+            lines.push(parse_plain_line(""));
+        }
+
+        for value in values {
+            let text = value_to_plain(value);
+            lines.push(parse_plain_line(&format!("- {}", text)));
+        }
+
+        if !lines.is_empty() {
+            return lines;
+        }
+    }
+
     fallback_lines(payload)
 }
 
@@ -151,6 +179,16 @@ fn render_text(payload: &Payload) -> Vec<DetailLine> {
         .content_string("content")
         .map(|text| text.lines().map(parse_plain_line).collect())
         .unwrap_or_else(|| fallback_lines(payload))
+}
+
+fn render_label(payload: &Payload) -> Vec<DetailLine> {
+    let label = payload
+        .content_string("label")
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .unwrap_or("label payload");
+
+    vec![parse_plain_line(label)]
 }
 
 fn render_json(payload: &Payload) -> Vec<DetailLine> {
@@ -677,6 +715,24 @@ impl TableModel {
 fn format_table_value(value: &Value) -> String {
     match value {
         Value::String(text) => clean_html_text(text),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(array) => format!("[array {}]", array.len()),
+        Value::Object(object) => format!("{{object {} keys}}", object.len()),
+    }
+}
+
+fn value_to_plain(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            let cleaned = clean_html_text(text);
+            if cleaned.is_empty() {
+                text.clone()
+            } else {
+                cleaned
+            }
+        }
         Value::Bool(boolean) => boolean.to_string(),
         Value::Number(number) => number.to_string(),
         Value::Null => "null".to_string(),

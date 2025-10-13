@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
 
@@ -14,4 +14,13 @@ pub struct Config {
         help = "Bind address for incoming Ray HTTP requests"
     )]
     pub bind_addr: SocketAddr,
+
+    /// Optional file path to dump raw Ray payloads for debugging.
+    #[arg(
+        long = "debug-dump",
+        env = "RAYGUN_DEBUG_DUMP",
+        value_name = "FILE",
+        help = "Append each incoming payload to FILE for offline inspection"
+    )]
+    pub debug_dump: Option<PathBuf>,
 }

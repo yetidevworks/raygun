@@ -12,15 +12,15 @@ use color_eyre::{
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use html_escape::decode_html_entities;
-use serde_json::Value;
+use serde_json::{Number, Value};
 use tokio::{select, sync::mpsc};
 use tracing::{debug, info, warn};
 
 use crate::{
     config::Config,
-    protocol::{Payload, PayloadKind},
+    protocol::{Origin, Payload, PayloadKind},
     server,
-    state::{AppState, TimelineEvent},
+    state::{AppState, PayloadLogger, TimelineEvent},
     tui::{self, AppViewModel, DetailStateView, Event, LayoutConfig, TerminalGuard, TimelineEntry},
     ui::detail::{self, build_detail_view},
 };
@@ -54,7 +54,11 @@ const TIMELINE_VIEW_LIMIT: usize = 200;
 
 impl RaygunApp {
     pub async fn bootstrap(config: Config) -> Result<Self> {
-        let state = Arc::new(AppState::default());
+        let payload_logger = config
+            .debug_dump
+            .as_ref()
+            .map(|path| PayloadLogger::new(path.clone()));
+        let state = Arc::new(AppState::with_logger(payload_logger));
         let bind_addr = config.bind_addr;
         let server = server::spawn(Arc::clone(&state), server::ServerConfig { bind_addr })
             .await
@@ -198,8 +202,7 @@ impl RaygunApp {
         let detail = self
             .selected
             .and_then(|index| ordered_events.get(index))
-            .and_then(|event| primary_payload(event).map(|payload| (payload, event)))
-            .map(|(payload, event)| build_detail_view(payload, event.received_at));
+            .map(build_detail_view_for_event);
 
         let debug_json = if self.show_debug {
             self.selected
@@ -796,19 +799,24 @@ impl<'a> DetailContext<'a> {
 fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
     let elapsed = event.received_at.elapsed().unwrap_or_default();
 
-    let payload_ref = primary_payload(event);
-    let mut timeline_label: Option<String> = None;
+    let aggregated = aggregated_log_payload(event);
+    let payload_ref = aggregated
+        .as_ref()
+        .map(|payload| payload as &Payload)
+        .or_else(|| primary_payload(event));
+
+    let mut timeline_label = aggregated
+        .as_ref()
+        .and_then(|payload| payload.content_string("label"))
+        .map(|label| label.to_string())
+        .or_else(|| event.label.clone());
 
     let (kind, mut summary) = if let Some(payload) = payload_ref {
-        if matches!(payload.kind, PayloadKind::Log) {
-            timeline_label = payload.content_string("label").and_then(|label| {
-                let trimmed = label.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
+        if timeline_label.is_none() {
+            timeline_label = payload
+                .content_string("label")
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty());
         }
 
         (payload_kind_label(&payload.kind), payload_summary(payload))
@@ -839,8 +847,120 @@ fn primary_payload(event: &TimelineEvent) -> Option<&Payload> {
         .or_else(|| event.request.payloads.first())
 }
 
+fn build_detail_view_for_event(event: &TimelineEvent) -> detail::DetailViewModel {
+    if let Some(merged) = aggregated_log_payload(event) {
+        return build_detail_view(&merged, event.received_at);
+    }
+
+    if let Some(payload) = primary_payload(event) {
+        return build_detail_view(payload, event.received_at);
+    }
+
+    detail::DetailViewModel {
+        header: "no payloads".to_string(),
+        footer: String::new(),
+        lines: vec![detail::DetailLine {
+            indent: 0,
+            segments: vec![detail::DetailSegment {
+                text: "Request contains no payloads".to_string(),
+                style: detail::SegmentStyle::Plain,
+            }],
+        }],
+    }
+}
+
+fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
+    use serde_json::Map;
+
+    let mut values: Vec<Value> = Vec::new();
+    let mut label: Option<String> = None;
+    let mut origin_snapshot: Option<&Origin> = None;
+
+    for payload in &event.request.payloads {
+        match payload.kind {
+            PayloadKind::Log => {
+                if origin_snapshot.is_none() {
+                    origin_snapshot = payload.origin.as_ref();
+                }
+
+                if let Some(object) = payload.content_object() {
+                    if let Some(array) = object.get("values").and_then(|value| value.as_array()) {
+                        values.extend(array.iter().cloned());
+                    }
+
+                    if label.is_none() {
+                        if let Some(found) = object
+                            .get("label")
+                            .and_then(|value| value.as_str())
+                            .map(|text| text.trim())
+                            .filter(|text| !text.is_empty())
+                        {
+                            label = Some(found.to_string());
+                        }
+                    }
+                }
+            }
+            PayloadKind::Label => {
+                if label.is_none() {
+                    label = payload
+                        .content_object()
+                        .and_then(|map| map.get("label"))
+                        .and_then(|value| value.as_str())
+                        .map(|text| text.trim().to_string())
+                        .filter(|text| !text.is_empty());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if label.is_none() {
+        label = event.label.clone();
+    }
+
+    if values.is_empty() && label.is_none() {
+        return None;
+    }
+
+    if label.is_none() {
+        label = event
+            .request
+            .payloads
+            .iter()
+            .find_map(|payload| payload.content_string("label"))
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+    }
+
+    let mut content = Map::new();
+    content.insert("values".to_string(), Value::Array(values));
+    if let Some(label_value) = label {
+        content.insert("label".to_string(), Value::String(label_value));
+    }
+
+    let mut root = Map::new();
+    root.insert("type".to_string(), Value::String("log".to_string()));
+    root.insert("content".to_string(), Value::Object(content));
+
+    if let Some(origin) = origin_snapshot {
+        let mut origin_map = Map::new();
+        if let Some(file) = &origin.file {
+            origin_map.insert("file".to_string(), Value::String(file.clone()));
+        }
+        if let Some(line) = origin.line_number {
+            origin_map.insert("line_number".to_string(), Value::Number(Number::from(line)));
+        }
+        if let Some(host) = &origin.hostname {
+            origin_map.insert("hostname".to_string(), Value::String(host.clone()));
+        }
+        root.insert("origin".to_string(), Value::Object(origin_map));
+    }
+
+    serde_json::from_value(Value::Object(root)).ok()
+}
+
 fn is_primary_payload_kind(kind: &PayloadKind) -> bool {
-    !matches!(kind, PayloadKind::Color)
+    !matches!(kind, PayloadKind::Color | PayloadKind::Label)
 }
 
 fn payload_kind_label(kind: &PayloadKind) -> String {
@@ -863,6 +983,7 @@ fn payload_kind_label(kind: &PayloadKind) -> String {
         PayloadKind::Boolean => "boolean",
         PayloadKind::Size => "size",
         PayloadKind::Color => "color",
+        PayloadKind::Label => "label",
         PayloadKind::Trace => "trace",
         PayloadKind::Caller => "caller",
         PayloadKind::Measure => "measure",
@@ -936,6 +1057,10 @@ fn payload_summary(payload: &Payload) -> String {
             .content_string("color")
             .map(|value| format!("color {}", value))
             .unwrap_or_else(|| "color".to_string()),
+        PayloadKind::Label => payload
+            .content_string("label")
+            .map(|value| format!("label {}", value))
+            .unwrap_or_else(|| "label".to_string()),
         PayloadKind::Trace => "stack trace".to_string(),
         PayloadKind::Caller => "caller".to_string(),
         PayloadKind::Measure => payload

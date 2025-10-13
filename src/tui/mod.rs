@@ -425,7 +425,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .title("Keymap")
         .style(Style::default().fg(Color::DarkGray));
 
-    let content = Paragraph::new("? help · f cycle color · ctrl+l cycle layout · ctrl+k clear timeline · ctrl+d raw payload · Tab focus detail · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse · Space toggle · q/esc quit")
+    let content = Paragraph::new("? help · f cycle color · ctrl+l cycle layout · ctrl+k clear timeline · ctrl+d raw payload · Tab focus detail · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse · Space toggle · q quit · ctrl+c force quit")
     .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(block, area);
@@ -496,7 +496,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     lines.push(Line::from(vec![
         Span::styled("Global: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(
-            "f cycle color filter · ctrl+k clear timeline · ctrl+d raw payload · ? close help · q/esc quit · Ctrl+C force quit",
+            "f cycle color filter · ctrl+k clear timeline · ctrl+d raw payload · ? close help · q quit · Ctrl+C force quit",
         ),
     ]));
 
