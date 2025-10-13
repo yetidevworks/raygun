@@ -17,6 +17,7 @@ pub struct TimelineEvent {
     pub received_at: SystemTime,
     pub request: Arc<RayRequest>,
     pub screen: Option<String>,
+    pub color: Option<String>,
 }
 
 impl TimelineEvent {
@@ -26,6 +27,7 @@ impl TimelineEvent {
             received_at: SystemTime::now(),
             request: Arc::new(request),
             screen,
+            color: None,
         }
     }
 }
@@ -124,6 +126,12 @@ impl AppState {
         let mut inner = self.inner.write().await;
         inner.locks.remove(name);
     }
+
+    pub async fn clear_timeline(&self) {
+        let mut inner = self.inner.write().await;
+        inner.timeline.clear();
+        inner.current_screen = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -137,6 +145,7 @@ impl StateInner {
     fn apply_payloads(&mut self, event: &mut TimelineEvent) -> ApplyOutcome {
         let mut displayable = false;
         let mut outcome = ApplyOutcome::Record;
+        let mut pending_color: Option<String> = None;
 
         for payload in &event.request.payloads {
             match &payload.kind {
@@ -183,6 +192,13 @@ impl StateInner {
                     }
                     displayable = true;
                 }
+                PayloadKind::Color => {
+                    if let Some(value) = payload.content_string("color") {
+                        let color_value = value.to_owned();
+                        event.color = Some(color_value.clone());
+                        pending_color = Some(color_value);
+                    }
+                }
                 _ => {}
             }
 
@@ -201,7 +217,6 @@ impl StateInner {
                     | PayloadKind::Separator
                     | PayloadKind::Measure
                     | PayloadKind::PhpInfo
-                    | PayloadKind::Color
                     | PayloadKind::Size
                     | PayloadKind::Caller
                     | PayloadKind::ShowBrowser
@@ -216,6 +231,11 @@ impl StateInner {
         }
 
         if !displayable {
+            if let Some(color_value) = pending_color {
+                if let Some(last) = self.timeline.back_mut() {
+                    last.color = Some(color_value);
+                }
+            }
             outcome = ApplyOutcome::Skip;
         }
 
@@ -399,5 +419,114 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].screen.as_deref(), Some("Debug"));
         assert_eq!(events[1].screen.as_deref(), Some("Debug"));
+    }
+
+    #[tokio::test]
+    async fn color_payload_sets_event_color() {
+        let state = AppState::default();
+
+        let color = make_payload(json!({
+            "type": "color",
+            "content": { "color": "blue" }
+        }));
+
+        let log = make_payload(json!({
+            "type": "log",
+            "content": { "values": ["hello"], "meta": [] }
+        }));
+
+        let request = RayRequest {
+            uuid: "color-test".into(),
+            payloads: vec![color, log],
+            meta: BTreeMap::new(),
+        };
+
+        let event = state
+            .record_request(request)
+            .await
+            .expect("request should record");
+
+        assert_eq!(event.color.as_deref(), Some("blue"));
+    }
+
+    #[tokio::test]
+    async fn color_only_payload_is_skipped() {
+        let state = AppState::default();
+
+        let color = make_payload(json!({
+            "type": "color",
+            "content": { "color": "green" }
+        }));
+
+        let request = RayRequest {
+            uuid: "color-only".into(),
+            payloads: vec![color],
+            meta: BTreeMap::new(),
+        };
+
+        assert!(
+            state.record_request(request).await.is_none(),
+            "color-only payload should not appear in timeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn color_payload_updates_previous_event() {
+        let state = AppState::default();
+
+        let log = make_payload(json!({
+            "type": "log",
+            "content": { "values": ["hello"], "meta": [] }
+        }));
+
+        let stored = state
+            .record_request(request_with_payload(log))
+            .await
+            .expect("log should record");
+        assert!(stored.color.is_none());
+
+        let color = make_payload(json!({
+            "type": "color",
+            "content": { "color": "green" }
+        }));
+
+        let request = RayRequest {
+            uuid: "color-followup".into(),
+            payloads: vec![color],
+            meta: BTreeMap::new(),
+        };
+
+        let outcome = state.record_request(request).await;
+        assert!(
+            outcome.is_none(),
+            "color follow-up should not create a new event"
+        );
+
+        let events = state.timeline_snapshot().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].color.as_deref(), Some("green"));
+    }
+
+    #[tokio::test]
+    async fn clear_timeline_method_resets_events() {
+        let state = AppState::default();
+
+        let log = make_payload(json!({
+            "type": "log",
+            "content": { "values": ["hello"], "meta": [] }
+        }));
+
+        state
+            .record_request(request_with_payload(log))
+            .await
+            .expect("log should record");
+
+        state.clear_timeline().await;
+
+        let events = state.timeline_snapshot().await;
+        assert!(
+            events.is_empty(),
+            "timeline should be empty after manual clear"
+        );
     }
 }

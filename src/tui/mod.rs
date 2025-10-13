@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use tokio::{sync::mpsc, task};
 use tracing::{debug, error};
@@ -37,6 +37,8 @@ pub struct TimelineEntry {
     pub kind: String,
     pub summary: String,
     pub age: String,
+    pub color: Option<String>,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,10 @@ pub struct AppViewModel {
     pub detail_scroll: usize,
     pub layout: LayoutConfig,
     pub detail_state: Option<DetailStateView>,
+    pub active_color_filter: Option<String>,
+    pub available_colors: Vec<String>,
+    pub show_help: bool,
+    pub debug_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,23 +176,40 @@ pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     render_timeline(frame, layout[1], view_model);
     render_detail(frame, layout[2], view_model);
     render_footer(frame, layout[3]);
+
+    if view_model.show_help {
+        render_help_overlay(frame, view_model);
+    } else if let Some(json) = view_model.debug_json.as_deref() {
+        render_debug_overlay(frame, json);
+    }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
+    let mut title = format!(
+        "Raygun — waiting for payloads ({} total) @ {}",
+        view_model.total_events, view_model.bind_addr
+    );
+
+    if let Some(color) = &view_model.active_color_filter {
+        title.push_str(&format!(" | color filter: {}", color));
+    }
+
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .title(format!(
-            "Raygun — waiting for payloads ({} total) @ {}",
-            view_model.total_events, view_model.bind_addr
-        ))
+        .title(title)
         .style(Style::default().fg(Color::Cyan));
 
     frame.render_widget(block, area);
 }
 
 fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
+    let mut title = "Timeline".to_string();
+    if let Some(filter) = &view_model.active_color_filter {
+        title = format!("Timeline (color = {})", filter);
+    }
+
     let block = Block::default()
-        .title("Timeline")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if view_model.focus_detail {
             Color::DarkGray
@@ -207,12 +230,21 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
     }
 
     if view_model.timeline.is_empty() {
-        let content = Paragraph::new(format!(
-            "Waiting for Ray payloads…\n\nUse the PHP `ray()` helper to send data here.\nListening on {}.\nPress `q` to exit.",
-            view_model.bind_addr
-        ))
-        .wrap(Wrap { trim: true })
-        .style(Style::default().fg(Color::Gray));
+        let message = if let Some(filter) = &view_model.active_color_filter {
+            format!(
+                "No payloads match color filter `{}`.\nPress `f` to clear the filter.",
+                filter
+            )
+        } else {
+            format!(
+                "Waiting for Ray payloads…\n\nUse the PHP `ray()` helper to send data here.\nListening on {}.\nPress `q` to exit.",
+                view_model.bind_addr
+            )
+        };
+
+        let content = Paragraph::new(message)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Gray));
 
         frame.render_widget(content, inner_area);
         return;
@@ -229,14 +261,46 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
     let mut items = Vec::new();
     for idx in start..(start + view_height).min(total) {
         if let Some(entry) = view_model.timeline.get(idx) {
-            let text = format!("[{}] {} · {}", entry.kind, entry.summary, entry.age);
-            let base = Style::default().fg(Color::Gray);
-            let style = if Some(idx) == view_model.selected {
-                base.add_modifier(Modifier::BOLD).bg(Color::DarkGray)
+            let is_selected = Some(idx) == view_model.selected;
+            let highlight_style = if is_selected {
+                Some(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                base
+                None
             };
-            items.push(ListItem::new(text).style(style));
+
+            let bullet_color = entry
+                .color
+                .as_deref()
+                .and_then(color_from_name)
+                .unwrap_or(Color::DarkGray);
+
+            let mut bullet_style = Style::default()
+                .fg(bullet_color)
+                .add_modifier(Modifier::BOLD);
+            let mut text_style = Style::default().fg(Color::Gray);
+            if let Some(style) = highlight_style {
+                bullet_style = bullet_style.patch(style);
+                text_style = text_style.patch(style);
+            }
+
+            let bullet_span = Span::styled("⬤", bullet_style);
+            let text = format!("[{}] {} · {}", entry.kind, entry.summary, entry.age);
+            let mut spans = vec![bullet_span, Span::raw(" "), Span::styled(text, text_style)];
+
+            if let Some(label) = entry.label.as_deref() {
+                let mut label_style = Style::default().fg(Color::DarkGray);
+                if let Some(style) = highlight_style {
+                    label_style = label_style.patch(style);
+                }
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(format!("({})", label), label_style));
+            }
+
+            items.push(ListItem::new(Line::from(spans)));
         }
     }
 
@@ -360,9 +424,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .title("Keymap")
         .style(Style::default().fg(Color::DarkGray));
 
-    let content = Paragraph::new(
-        "q/esc quit · ctrl+c quit · Tab focus detail · ctrl+l cycle layout · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse · Space toggle",
-    )
+    let content = Paragraph::new("? help · f cycle color · ctrl+l cycle layout · ctrl+k clear timeline · ctrl+d raw payload · Tab focus detail · ↑/↓ navigate · PgUp/PgDn jump · Enter/→ expand · ← collapse · Space toggle · q/esc quit")
     .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(block, area);
@@ -384,6 +446,139 @@ fn inner(area: Rect) -> Rect {
         y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
+    }
+}
+
+fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
+    let area = centered_rect(80, 70, frame.size());
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Keymap & Controls",
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Navigation: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("↑/↓, j/k move · PgUp/PgDn jump · Home/End to bounds · Tab switches focus"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Details: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("Enter/→ expand · ← collapse · Space toggle · Ctrl+L cycle layout"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Global: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(
+            "f cycle color filter · ctrl+k clear timeline · ctrl+d raw payload · ? close help · q/esc quit · Ctrl+C force quit",
+        ),
+    ]));
+
+    if !view_model.available_colors.is_empty() {
+        lines.push(Line::raw(""));
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            "Available colors: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        for color in &view_model.available_colors {
+            let block_style = color_from_name(color)
+                .map(|color| Style::default().bg(color).fg(Color::Black))
+                .unwrap_or_else(|| Style::default().bg(Color::DarkGray).fg(Color::Black));
+            spans.push(Span::styled("  ", block_style));
+            spans.push(Span::raw(format!(" {}  ", color)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(
+        "Tips: use `f` repeatedly to cycle colors; when no color matches the filter, the timeline shows a hint.",
+    ));
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Help")
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_debug_overlay(frame: &mut Frame<'_>, json: &str) {
+    let area = centered_rect(90, 80, frame.size());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Raw Payload (Ctrl+D to close)")
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let paragraph = Paragraph::new(json.to_string())
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::Gray))
+        .block(block);
+
+    frame.render_widget(paragraph, area);
+}
+
+fn color_from_name(name: &str) -> Option<Color> {
+    let normalized = name.trim().to_lowercase();
+    match normalized.as_str() {
+        "red" => Some(Color::Rgb(255, 82, 82)),
+        "green" => Some(Color::Rgb(48, 209, 88)),
+        "blue" => Some(Color::Rgb(64, 156, 255)),
+        "yellow" => Some(Color::Rgb(255, 214, 10)),
+        "orange" => Some(Color::Rgb(255, 159, 10)),
+        "purple" | "magenta" => Some(Color::Rgb(191, 90, 242)),
+        "pink" => Some(Color::Rgb(255, 55, 95)),
+        "gray" | "grey" => Some(Color::Rgb(138, 141, 165)),
+        "white" => Some(Color::White),
+        "black" => Some(Color::Black),
+        "cyan" => Some(Color::Rgb(100, 210, 255)),
+        "teal" => Some(Color::Rgb(64, 200, 224)),
+        "lightblue" => Some(Color::Rgb(173, 216, 230)),
+        "lightgreen" => Some(Color::Rgb(144, 238, 144)),
+        "brown" => Some(Color::Rgb(141, 110, 99)),
+        _ => {
+            let hex = normalized.strip_prefix('#').unwrap_or(&normalized);
+            if hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    u8::from_str_radix(&hex[0..2], 16),
+                    u8::from_str_radix(&hex[2..4], 16),
+                    u8::from_str_radix(&hex[4..6], 16),
+                ) {
+                    return Some(Color::Rgb(r, g, b));
+                }
+            }
+            None
+        }
     }
 }
 

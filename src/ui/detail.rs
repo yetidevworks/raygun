@@ -58,6 +58,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
     let lines = match &payload.kind {
         PayloadKind::Log => render_log(payload),
         PayloadKind::Text => render_text(payload),
+        PayloadKind::Table => render_table(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
         _ => fallback_lines(payload),
     };
@@ -163,6 +164,55 @@ fn render_json(payload: &Payload) -> Vec<DetailLine> {
         .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
         .map(|json| json.lines().map(parse_plain_line).collect())
         .unwrap_or_else(|| fallback_lines(payload))
+}
+
+fn render_table(payload: &Payload) -> Vec<DetailLine> {
+    let content = match payload.content_object() {
+        Some(content) => content,
+        None => return fallback_lines(payload),
+    };
+
+    let values = match content.get("values").and_then(|value| value.as_array()) {
+        Some(values) => values,
+        None => return fallback_lines(payload),
+    };
+
+    if let Some(model) = values
+        .iter()
+        .find_map(|value| value.as_str().and_then(TableModel::from_html))
+    {
+        return render_table_model(payload, model);
+    }
+
+    if values.is_empty() {
+        return vec![parse_plain_line("(empty table)")];
+    }
+
+    let table = match TableModel::from_values(values) {
+        Some(table) => table,
+        None => return fallback_lines(payload),
+    };
+
+    render_table_model(payload, table)
+}
+
+fn render_table_model(payload: &Payload, table: TableModel) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+
+    if let Some(label) = payload
+        .content_string("label")
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        lines.push(parse_plain_line(&format!("Label: {}", label)));
+        lines.push(parse_plain_line(""));
+    }
+
+    for line in table.to_lines() {
+        lines.push(parse_plain_line(&line));
+    }
+
+    lines
 }
 
 fn fallback_lines(payload: &Payload) -> Vec<DetailLine> {
@@ -411,12 +461,17 @@ static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"^(\+?\[[^\]]+\]|\+["'][^"']+["']|[-+][\w$]+:)"#).unwrap());
 static TYPE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?:stdClass#\d+|array:\d+|object\([^)]*\)|[\w\\]+(?:<[^>]+>)?\s*\{#\d+)")
-        .unwrap()
+    Regex::new(r"^(?:stdClass#\d+|array:\d+|object\([^)]*\)|[\w\\]+(?:<[^>]+>)?\s*\{#\d+)").unwrap()
 });
 static BOOL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(true|false)\b").unwrap());
 static NULL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^null\b").unwrap());
 static NUMBER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^-?\d+(?:\.\d+)?").unwrap());
+static TABLE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<table[^>]*>(.*?)</table>").unwrap());
+static TR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<tr[^>]*>(.*?)</tr>").unwrap());
+static TH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<th[^>]*>(.*?)</th>").unwrap());
+static TD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<td[^>]*>(.*?)</td>").unwrap());
+static SCRIPT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
 
 fn compute_has_children(lines: &[DetailLine]) -> Vec<bool> {
     let mut result = vec![false; lines.len()];
@@ -438,9 +493,205 @@ fn compute_has_children(lines: &[DetailLine]) -> Vec<bool> {
     result
 }
 
+struct TableModel {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl TableModel {
+    fn from_values(values: &[Value]) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+
+        if values.iter().all(|value| value.is_object()) {
+            let mut headers: Vec<String> = Vec::new();
+            for value in values {
+                if let Some(object) = value.as_object() {
+                    for key in object.keys() {
+                        if !headers.iter().any(|existing| existing == key) {
+                            headers.push(key.clone());
+                        }
+                    }
+                }
+            }
+
+            let mut rows = Vec::new();
+            for value in values {
+                if let Some(object) = value.as_object() {
+                    let mut cells = Vec::new();
+                    for header in &headers {
+                        let cell = object
+                            .get(header)
+                            .map(format_table_value)
+                            .unwrap_or_default();
+                        cells.push(cell);
+                    }
+                    rows.push(cells);
+                }
+            }
+
+            return Some(Self { headers, rows });
+        }
+
+        if values.iter().all(|value| value.is_array()) {
+            let column_count = values
+                .iter()
+                .filter_map(|value| value.as_array().map(|array| array.len()))
+                .max()
+                .unwrap_or(0);
+
+            let headers = (0..column_count)
+                .map(|idx| format!("col {}", idx + 1))
+                .collect::<Vec<_>>();
+
+            let mut rows = Vec::new();
+            for value in values {
+                if let Some(array) = value.as_array() {
+                    let mut cells = Vec::new();
+                    for idx in 0..column_count {
+                        let cell = array.get(idx).map(format_table_value).unwrap_or_default();
+                        cells.push(cell);
+                    }
+                    rows.push(cells);
+                }
+            }
+
+            return Some(Self { headers, rows });
+        }
+
+        let headers = vec!["value".to_string()];
+        let rows = values
+            .iter()
+            .map(|value| vec![format_table_value(value)])
+            .collect::<Vec<_>>();
+
+        Some(Self { headers, rows })
+    }
+
+    fn from_html(html: &str) -> Option<Self> {
+        let table_segment = TABLE_RE
+            .captures(html)
+            .and_then(|capture| capture.get(1))
+            .map(|m| m.as_str())?;
+
+        let headers: Vec<String> = TH_RE
+            .captures_iter(table_segment)
+            .map(|cap| clean_html_text(cap.get(1).map(|m| m.as_str()).unwrap_or("")))
+            .collect();
+
+        if headers.is_empty() {
+            return None;
+        }
+
+        let mut rows = Vec::new();
+        for row_cap in TR_RE.captures_iter(table_segment) {
+            let row_html = row_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let cells: Vec<String> = TD_RE
+                .captures_iter(row_html)
+                .map(|cap| clean_html_text(cap.get(1).map(|m| m.as_str()).unwrap_or("")))
+                .collect();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+
+        if rows.is_empty() {
+            return None;
+        }
+
+        Some(Self { headers, rows })
+    }
+
+    fn to_lines(&self) -> Vec<String> {
+        let mut widths: Vec<usize> = self
+            .headers
+            .iter()
+            .map(|header| display_width(header))
+            .collect();
+
+        for row in &self.rows {
+            for (idx, cell) in row.iter().enumerate() {
+                if let Some(width) = widths.get_mut(idx) {
+                    *width = (*width).max(display_width(cell));
+                }
+            }
+        }
+
+        let border = format_border(&widths, '-');
+        let separator = format_border(&widths, '=');
+        let header_line = format_row(&self.headers, &widths);
+
+        let mut lines = Vec::new();
+        lines.push(border.clone());
+        lines.push(header_line);
+        lines.push(separator);
+        for row in &self.rows {
+            lines.push(format_row(row, &widths));
+        }
+        lines.push(border);
+
+        lines
+    }
+}
+
+fn format_table_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => truncate(text, 80),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(array) => format!("[array {}]", array.len()),
+        Value::Object(object) => format!("{{object {} keys}}", object.len()),
+    }
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    let flat = text.replace('\n', " ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+
+    let truncated: String = flat.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{}...", truncated)
+}
+
+fn format_border(widths: &[usize], fill: char) -> String {
+    let mut line = String::from("+");
+    for width in widths {
+        line.push_str(&fill.to_string().repeat(width + 2));
+        line.push('+');
+    }
+    line
+}
+
+fn format_row(cells: &[String], widths: &[usize]) -> String {
+    let mut line = String::from("|");
+    for (idx, width) in widths.iter().enumerate() {
+        let value = cells.get(idx).map(|cell| cell.as_str()).unwrap_or("");
+        line.push(' ');
+        line.push_str(&format!("{value:<width$}", value = value, width = *width));
+        line.push(' ');
+        line.push('|');
+    }
+    line
+}
+
+fn clean_html_text(input: &str) -> String {
+    let without_script = SCRIPT_RE.replace_all(input, "");
+    let stripped = TAG_RE.replace_all(&without_script, "");
+    let decoded = decode_html_entities(stripped.trim()).into_owned();
+    truncate(&decoded, 80)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parses_nested_sf_dump_with_object_markers() {
@@ -462,10 +713,7 @@ mod tests {
 
         let lines = parse_sf_dump(dump);
         let indents: Vec<usize> = lines.iter().map(|line| line.indent).collect();
-        assert_eq!(
-            indents,
-            vec![0, 1, 1, 2, 1, 1, 2, 2, 3, 2, 1, 0]
-        );
+        assert_eq!(indents, vec![0, 1, 1, 2, 1, 1, 2, 2, 3, 2, 1, 0]);
 
         let type_segment_present = lines.iter().any(|line| {
             line.segments.iter().any(|segment| {
@@ -477,5 +725,45 @@ mod tests {
             type_segment_present,
             "expected App\\User {{#1 to be treated as a type segment"
         );
+    }
+
+    #[test]
+    fn renders_table_payload_as_ascii() {
+        let html = r#"
+<script>window.Sfdump</script>
+<table>
+  <thead>
+    <tr><th>Name</th><th>Email</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Alice</td><td>alice@example.com</td></tr>
+    <tr><td>Bob</td><td>bob@example.com</td></tr>
+  </tbody>
+</table>
+"#;
+        let payload: Payload = serde_json::from_value(json!({
+            "type": "table",
+            "content": {
+                "values": [html],
+                "label": "Users"
+            }
+        }))
+        .expect("payload should deserialize");
+
+        let lines = render_table(&payload);
+        assert_eq!(lines[0].segments[0].text, "Label: Users");
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.segments
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("Name")));
+        assert!(rendered.iter().any(|line| line.contains("Alice")));
     }
 }

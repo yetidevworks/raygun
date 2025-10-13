@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::ErrorKind,
     net::SocketAddr,
     sync::Arc,
@@ -7,8 +7,8 @@ use std::{
 };
 
 use color_eyre::{
-    eyre::{eyre, Report},
     Result,
+    eyre::{Report, eyre},
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use html_escape::decode_html_entities;
@@ -37,6 +37,10 @@ pub struct RaygunApp {
     layout: LayoutPreset,
     detail_states: HashMap<Uuid, DetailState>,
     visible_events: Vec<Uuid>,
+    color_filter: Option<String>,
+    available_colors: Vec<String>,
+    show_help: bool,
+    show_debug: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +76,10 @@ impl RaygunApp {
             layout: LayoutPreset::DetailFocus,
             detail_states: HashMap::new(),
             visible_events: Vec::new(),
+            color_filter: None,
+            available_colors: Vec::new(),
+            show_help: false,
+            show_debug: false,
         })
     }
 
@@ -140,6 +148,28 @@ impl RaygunApp {
             ordered_events.truncate(TIMELINE_VIEW_LIMIT);
         }
 
+        let mut available_colors = BTreeSet::new();
+        for event in &ordered_events {
+            if let Some(color) = &event.color {
+                available_colors.insert(color.clone());
+            }
+        }
+        self.available_colors = available_colors.into_iter().collect();
+
+        if let Some(filter) = &self.color_filter {
+            if !self.available_colors.iter().any(|value| value == filter) {
+                self.color_filter = None;
+            }
+        }
+
+        if let Some(filter) = &self.color_filter {
+            ordered_events.retain(|event| event.color.as_deref() == Some(filter.as_str()));
+        }
+
+        if ordered_events.is_empty() {
+            self.show_debug = false;
+        }
+
         let previous_selection = self.selected;
 
         if ordered_events.is_empty() {
@@ -165,14 +195,16 @@ impl RaygunApp {
         let detail = self
             .selected
             .and_then(|index| ordered_events.get(index))
-            .and_then(|event| {
-                event
-                    .request
-                    .payloads
-                    .first()
-                    .map(|payload| (payload, event))
-            })
+            .and_then(|event| primary_payload(event).map(|payload| (payload, event)))
             .map(|(payload, event)| build_detail_view(payload, event.received_at));
+
+        let debug_json = if self.show_debug {
+            self.selected
+                .and_then(|index| ordered_events.get(index))
+                .map(|event| format!("{:#?}", event))
+        } else {
+            None
+        };
 
         let mut detail_state_view = None;
 
@@ -217,6 +249,10 @@ impl RaygunApp {
             detail_scroll: self.detail_scroll,
             layout: self.layout.config(),
             detail_state: detail_state_view,
+            active_color_filter: self.color_filter.clone(),
+            available_colors: self.available_colors.clone(),
+            show_help: self.show_help,
+            debug_json,
         }
     }
 
@@ -227,155 +263,191 @@ impl RaygunApp {
         detail_ctx: &DetailContext,
     ) -> bool {
         match event {
-            Event::Input(key) => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => true,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-                KeyCode::Tab => {
-                    self.focus = match self.focus {
-                        Focus::Timeline => Focus::Detail,
-                        Focus::Detail => Focus::Timeline,
+            Event::Input(key) => {
+                if self.show_help {
+                    return match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+                        KeyCode::Char('q')
+                        | KeyCode::Char('Q')
+                        | KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Char('?') => {
+                            self.show_help = false;
+                            false
+                        }
+                        _ => false,
                     };
-                    if let Some(state) = self.current_detail_state() {
-                        self.detail_scroll =
-                            state.scroll.min(detail_ctx.visible_len().saturating_sub(1));
-                    } else {
-                        self.detail_scroll = 0;
+                }
+
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => true,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+                    KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.clear_local_timeline();
+                        false
                     }
-                    false
-                }
-                KeyCode::BackTab => {
-                    self.focus = Focus::Timeline;
-                    false
-                }
-                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.layout = self.layout.next();
-                    false
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_ctx.visible_len());
-                        if self.move_selection(1, timeline_len).is_some() {
-                            if let Some(state) = self.current_detail_state() {
-                                self.detail_scroll = state.scroll;
-                            } else {
-                                self.detail_scroll = 0;
-                            }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.show_debug = !self.show_debug;
+                        false
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('F') => {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            self.cycle_color_filter();
                         }
-                    } else {
-                        self.advance_detail_cursor(1, detail_ctx);
+                        false
                     }
-                    false
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_ctx.visible_len());
-                        if self.move_selection(-1, timeline_len).is_some() {
-                            if let Some(state) = self.current_detail_state() {
-                                self.detail_scroll = state.scroll;
-                            } else {
-                                self.detail_scroll = 0;
-                            }
-                        }
-                    } else {
-                        self.advance_detail_cursor(-1, detail_ctx);
+                    KeyCode::Char('?') => {
+                        self.show_help = true;
+                        false
                     }
-                    false
-                }
-                KeyCode::PageDown => {
-                    if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_ctx.visible_len());
-                        if self.move_selection(10, timeline_len).is_some() {
-                            if let Some(state) = self.current_detail_state() {
-                                self.detail_scroll = state.scroll;
-                            } else {
-                                self.detail_scroll = 0;
-                            }
-                        }
-                    } else {
-                        self.advance_detail_cursor(10, detail_ctx);
-                    }
-                    false
-                }
-                KeyCode::PageUp => {
-                    if self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_ctx.visible_len());
-                        if self.move_selection(-10, timeline_len).is_some() {
-                            if let Some(state) = self.current_detail_state() {
-                                self.detail_scroll = state.scroll;
-                            } else {
-                                self.detail_scroll = 0;
-                            }
-                        }
-                    } else {
-                        self.advance_detail_cursor(-10, detail_ctx);
-                    }
-                    false
-                }
-                KeyCode::Home => {
-                    if timeline_len > 0 && self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_ctx.visible_len());
-                        self.selected = Some(0);
+                    KeyCode::Tab => {
+                        self.focus = match self.focus {
+                            Focus::Timeline => Focus::Detail,
+                            Focus::Detail => Focus::Timeline,
+                        };
                         if let Some(state) = self.current_detail_state() {
-                            self.detail_scroll = state.scroll;
+                            self.detail_scroll =
+                                state.scroll.min(detail_ctx.visible_len().saturating_sub(1));
                         } else {
                             self.detail_scroll = 0;
                         }
-                    } else if self.focus == Focus::Detail {
-                        if let Some(state) = self.current_detail_state_mut() {
-                            state.cursor = 0;
-                            state.scroll = 0;
-                            self.detail_scroll = 0;
-                        }
+                        false
                     }
-                    false
-                }
-                KeyCode::End => {
-                    if timeline_len > 0 && self.focus == Focus::Timeline {
-                        self.store_detail_state(detail_ctx.visible_len());
-                        self.selected = Some(timeline_len.saturating_sub(1));
-                        if let Some(state) = self.current_detail_state() {
-                            self.detail_scroll = state.scroll;
+                    KeyCode::BackTab => {
+                        self.focus = Focus::Timeline;
+                        false
+                    }
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.layout = self.layout.next();
+                        false
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.focus == Focus::Timeline {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            if self.move_selection(1, timeline_len).is_some() {
+                                if let Some(state) = self.current_detail_state() {
+                                    self.detail_scroll = state.scroll;
+                                } else {
+                                    self.detail_scroll = 0;
+                                }
+                            }
                         } else {
-                            self.detail_scroll = 0;
+                            self.advance_detail_cursor(1, detail_ctx);
                         }
-                    } else if self.focus == Focus::Detail {
-                        if detail_ctx.visible_len() > 0 {
+                        false
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if self.focus == Focus::Timeline {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            if self.move_selection(-1, timeline_len).is_some() {
+                                if let Some(state) = self.current_detail_state() {
+                                    self.detail_scroll = state.scroll;
+                                } else {
+                                    self.detail_scroll = 0;
+                                }
+                            }
+                        } else {
+                            self.advance_detail_cursor(-1, detail_ctx);
+                        }
+                        false
+                    }
+                    KeyCode::PageDown => {
+                        if self.focus == Focus::Timeline {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            if self.move_selection(10, timeline_len).is_some() {
+                                if let Some(state) = self.current_detail_state() {
+                                    self.detail_scroll = state.scroll;
+                                } else {
+                                    self.detail_scroll = 0;
+                                }
+                            }
+                        } else {
+                            self.advance_detail_cursor(10, detail_ctx);
+                        }
+                        false
+                    }
+                    KeyCode::PageUp => {
+                        if self.focus == Focus::Timeline {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            if self.move_selection(-10, timeline_len).is_some() {
+                                if let Some(state) = self.current_detail_state() {
+                                    self.detail_scroll = state.scroll;
+                                } else {
+                                    self.detail_scroll = 0;
+                                }
+                            }
+                        } else {
+                            self.advance_detail_cursor(-10, detail_ctx);
+                        }
+                        false
+                    }
+                    KeyCode::Home => {
+                        if timeline_len > 0 && self.focus == Focus::Timeline {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            self.selected = Some(0);
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
+                            }
+                        } else if self.focus == Focus::Detail {
                             if let Some(state) = self.current_detail_state_mut() {
-                                let max = detail_ctx.visible_len().saturating_sub(1);
-                                state.cursor = max;
-                                state.scroll = max;
-                                self.detail_scroll = max;
+                                state.cursor = 0;
+                                state.scroll = 0;
+                                self.detail_scroll = 0;
                             }
                         }
+                        false
                     }
-                    false
-                }
-                KeyCode::Right | KeyCode::Enter => {
-                    if self.focus == Focus::Detail {
-                        if self.expand_current_node(detail_ctx) {
+                    KeyCode::End => {
+                        if timeline_len > 0 && self.focus == Focus::Timeline {
                             self.store_detail_state(detail_ctx.visible_len());
+                            self.selected = Some(timeline_len.saturating_sub(1));
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
+                            }
+                        } else if self.focus == Focus::Detail {
+                            if detail_ctx.visible_len() > 0 {
+                                if let Some(state) = self.current_detail_state_mut() {
+                                    let max = detail_ctx.visible_len().saturating_sub(1);
+                                    state.cursor = max;
+                                    state.scroll = max;
+                                    self.detail_scroll = max;
+                                }
+                            }
                         }
+                        false
                     }
-                    false
-                }
-                KeyCode::Left => {
-                    if self.focus == Focus::Detail {
-                        if self.collapse_current_node(detail_ctx) {
-                            self.store_detail_state(detail_ctx.visible_len());
+                    KeyCode::Right | KeyCode::Enter => {
+                        if self.focus == Focus::Detail {
+                            if self.expand_current_node(detail_ctx) {
+                                self.store_detail_state(detail_ctx.visible_len());
+                            }
                         }
+                        false
                     }
-                    false
-                }
-                KeyCode::Char(' ') => {
-                    if self.focus == Focus::Detail {
-                        if self.toggle_current_node(detail_ctx) {
-                            self.store_detail_state(detail_ctx.visible_len());
+                    KeyCode::Left => {
+                        if self.focus == Focus::Detail {
+                            if self.collapse_current_node(detail_ctx) {
+                                self.store_detail_state(detail_ctx.visible_len());
+                            }
                         }
+                        false
                     }
-                    false
+                    KeyCode::Char(' ') => {
+                        if self.focus == Focus::Detail {
+                            if self.toggle_current_node(detail_ctx) {
+                                self.store_detail_state(detail_ctx.visible_len());
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             Event::Tick => false,
             Event::Resize(width, height) => {
                 debug!(%width, %height, "terminal resized");
@@ -395,6 +467,51 @@ impl RaygunApp {
         let changed = self.selected != Some(new_index);
         self.selected = Some(new_index);
         if changed { Some(new_index) } else { None }
+    }
+
+    fn cycle_color_filter(&mut self) {
+        if self.available_colors.is_empty() {
+            self.color_filter = None;
+            return;
+        }
+
+        let next = match &self.color_filter {
+            None => Some(self.available_colors[0].clone()),
+            Some(current) => {
+                if let Some(position) = self
+                    .available_colors
+                    .iter()
+                    .position(|value| value == current)
+                {
+                    if position + 1 < self.available_colors.len() {
+                        Some(self.available_colors[position + 1].clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(self.available_colors[0].clone())
+                }
+            }
+        };
+
+        self.color_filter = next;
+        self.selected = Some(0);
+        self.detail_scroll = 0;
+    }
+
+    fn clear_local_timeline(&mut self) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            state.clear_timeline().await;
+        });
+        self.selected = None;
+        self.detail_scroll = 0;
+        self.detail_states.clear();
+        self.visible_events.clear();
+        self.available_colors.clear();
+        self.color_filter = None;
+        self.show_help = false;
+        self.show_debug = false;
     }
 
     fn advance_detail_cursor(&mut self, delta: i32, ctx: &DetailContext) {
@@ -632,32 +749,51 @@ impl<'a> DetailContext<'a> {
 fn summarize_event(event: &TimelineEvent) -> TimelineEntry {
     let elapsed = event.received_at.elapsed().unwrap_or_default();
 
-    if let Some(payload) = event.request.payloads.first() {
-        let kind = payload_kind_label(&payload.kind);
-        let mut summary = payload_summary(payload);
+    let payload_ref = primary_payload(event);
+    let mut timeline_label: Option<String> = None;
 
-        if let Some(screen) = event.screen.as_deref() {
-            summary = format!("{} | {}", screen, summary);
+    let (kind, mut summary) = if let Some(payload) = payload_ref {
+        if matches!(payload.kind, PayloadKind::Log) {
+            timeline_label = payload.content_string("label").and_then(|label| {
+                let trimmed = label.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            });
         }
 
-        TimelineEntry {
-            id: event.id,
-            kind,
-            summary,
-            age: format_elapsed(elapsed),
-        }
+        (payload_kind_label(&payload.kind), payload_summary(payload))
     } else {
-        let mut summary = "Request without payloads".to_string();
-        if let Some(screen) = event.screen.as_deref() {
-            summary = format!("{} | {}", screen, summary);
-        }
-        TimelineEntry {
-            id: event.id,
-            kind: "empty".to_string(),
-            summary,
-            age: format_elapsed(elapsed),
-        }
+        ("empty".to_string(), "Request without payloads".to_string())
+    };
+
+    if let Some(screen) = event.screen.as_deref() {
+        summary = format!("{} | {}", screen, summary);
     }
+
+    TimelineEntry {
+        id: event.id,
+        kind,
+        summary,
+        age: format_elapsed(elapsed),
+        color: event.color.clone(),
+        label: timeline_label,
+    }
+}
+
+fn primary_payload(event: &TimelineEvent) -> Option<&Payload> {
+    event
+        .request
+        .payloads
+        .iter()
+        .find(|payload| is_primary_payload_kind(&payload.kind))
+        .or_else(|| event.request.payloads.first())
+}
+
+fn is_primary_payload_kind(kind: &PayloadKind) -> bool {
+    !matches!(kind, PayloadKind::Color)
 }
 
 fn payload_kind_label(kind: &PayloadKind) -> String {
@@ -728,7 +864,10 @@ fn payload_summary(payload: &Payload) -> String {
             .and_then(|map| map.get("message"))
             .map(value_preview)
             .unwrap_or_else(|| "exception".to_string()),
-        PayloadKind::Table => "table".to_string(),
+        PayloadKind::Table => payload
+            .content_string("label")
+            .map(|text| clip(text, 80))
+            .unwrap_or_else(|| "table".to_string()),
         PayloadKind::Text => payload
             .content_string("content")
             .map(|text| clip(text, 80))
@@ -791,8 +930,16 @@ fn summarize_log(payload: &Payload) -> Option<String> {
         .content_object()
         .and_then(|map| map.get("values"))
         .and_then(|values| values.as_array())
-        .and_then(|values| values.first())
-        .map(value_preview)
+        .and_then(|values| {
+            let mut previews: Vec<String> = values.iter().map(value_preview).collect();
+            previews.retain(|value| !value.is_empty());
+            if previews.is_empty() {
+                None
+            } else {
+                let joined = previews.join(" | ");
+                Some(clip(&joined, 80))
+            }
+        })
 }
 
 fn value_preview(value: &Value) -> String {
