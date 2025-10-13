@@ -894,6 +894,12 @@ fn looks_like_html_snippet(text: &str) -> bool {
     trimmed.starts_with('<') && trimmed.contains('>')
 }
 
+fn looks_like_json_snippet(text: &str) -> bool {
+    let trimmed = text.trim();
+    (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+}
+
 fn contains_image_tag(html: &str) -> bool {
     HTML_IMG_SRC_RE.is_match(html)
 }
@@ -909,6 +915,10 @@ fn strip_html_tags(text: &str) -> String {
     let without_script = HTML_SCRIPT_RE.replace_all(text, "");
     let stripped = HTML_TAG_RE.replace_all(&without_script, " ").into_owned();
     flatten(stripped.trim())
+}
+
+fn contains_sf_dump(text: &str) -> bool {
+    text.contains("sf-dump")
 }
 
 fn aggregated_log_payload(event: &TimelineEvent) -> Option<Payload> {
@@ -1145,6 +1155,9 @@ fn custom_payload_type(payload: &Payload) -> Option<String> {
         if label.eq_ignore_ascii_case("image") {
             return Some("image".to_string());
         }
+        if label.eq_ignore_ascii_case("json") {
+            return Some("json".to_string());
+        }
         if is_default_html_label(label) {
             return Some("html".to_string());
         }
@@ -1159,8 +1172,14 @@ fn custom_payload_type(payload: &Payload) -> Option<String> {
         if contains_image_tag(content) {
             return Some("image".to_string());
         }
+        if contains_sf_dump(content) {
+            return Some("json".to_string());
+        }
         if looks_like_html_snippet(content) {
             return Some("html".to_string());
+        }
+        if looks_like_json_snippet(content) {
+            return Some("json".to_string());
         }
     }
 
@@ -1179,6 +1198,13 @@ fn summarize_custom(payload: &Payload) -> String {
             .or_else(|| content_value.and_then(|value| value.as_str()))
             .unwrap_or("image payload");
         return clip(&format!("image: {}", src), 80);
+    }
+
+    if type_hint.as_deref() == Some("json") {
+        return payload
+            .content_string("label")
+            .map(|label| clip(label, 80))
+            .unwrap_or_else(|| "json payload".to_string());
     }
 
     let body = content_value

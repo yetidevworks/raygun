@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use html_escape::decode_html_entities;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
 
 use crate::protocol::{Payload, PayloadKind};
@@ -62,6 +62,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         PayloadKind::Custom => render_custom(payload),
         PayloadKind::Label => render_label(payload),
         PayloadKind::Trace => render_trace(payload),
+        PayloadKind::Measure => render_measure(payload),
         PayloadKind::Caller => render_caller(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
         _ => fallback_lines(payload),
@@ -225,6 +226,18 @@ fn render_custom(payload: &Payload) -> Vec<DetailLine> {
                 .map(str::trim)
                 .filter(|label| !label.is_empty());
 
+            if contains_sf_dump(content) {
+                return render_sf_dump(content, raw_label);
+            }
+
+            let is_default_count_label = raw_label
+                .map(|label| label.eq_ignore_ascii_case("count"))
+                .unwrap_or(false);
+
+            if is_default_count_label {
+                return render_count(content, raw_label);
+            }
+
             let is_default_image_label = raw_label
                 .map(|label| label.eq_ignore_ascii_case("image"))
                 .unwrap_or(false);
@@ -260,6 +273,95 @@ fn render_label(payload: &Payload) -> Vec<DetailLine> {
         .unwrap_or("label payload");
 
     vec![parse_plain_line(label)]
+}
+
+fn render_count(content: &str, raw_label: Option<&str>) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+
+    if let Some(label) = raw_label
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .filter(|label| !label.eq_ignore_ascii_case("count"))
+    {
+        lines.push(parse_plain_line(&format!("Label: {}", label)));
+        lines.push(parse_plain_line(""));
+    }
+
+    lines.push(parse_plain_line(content.trim()));
+    lines
+}
+
+fn render_sf_dump(content: &str, raw_label: Option<&str>) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+
+    if let Some(label) = raw_label
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .filter(|label| !label.eq_ignore_ascii_case("json"))
+    {
+        lines.push(parse_plain_line(&format!("Label: {}", label)));
+        lines.push(parse_plain_line(""));
+    }
+
+    let mut dump_lines = parse_sf_dump(content);
+    if dump_lines.is_empty() {
+        dump_lines.push(parse_plain_line(content.trim()));
+    }
+    lines.extend(dump_lines);
+    lines
+}
+
+fn render_measure(payload: &Payload) -> Vec<DetailLine> {
+    let content = match payload.content_object() {
+        Some(object) => object,
+        None => return fallback_lines(payload),
+    };
+
+    let mut lines = Vec::new();
+
+    if let Some(name) = content.get("name").and_then(|value| value.as_str()) {
+        lines.push(detail_key_value("Name", name));
+    }
+
+    if let Some(value) = content.get("total_time") {
+        if let Some(formatted) = format_duration(value) {
+            lines.push(detail_key_value("Total time", &formatted));
+        }
+    }
+
+    if let Some(value) = content.get("time_since_last_call") {
+        if let Some(formatted) = format_duration(value) {
+            lines.push(detail_key_value("Since last call", &formatted));
+        }
+    }
+
+    if let Some(value) = content.get("max_memory_usage_during_total_time") {
+        if let Some(formatted) = format_bytes(value) {
+            lines.push(detail_key_value("Max memory (total)", &formatted));
+        }
+    }
+
+    if let Some(value) = content.get("max_memory_usage_since_last_call") {
+        if let Some(formatted) = format_bytes(value) {
+            lines.push(detail_key_value("Max memory (delta)", &formatted));
+        }
+    }
+
+    if let Some(new_timer) = content
+        .get("is_new_timer")
+        .and_then(|value| value.as_bool())
+    {
+        lines.push(detail_key_value(
+            "New timer",
+            if new_timer { "yes" } else { "no" },
+        ));
+    }
+
+    if lines.is_empty() {
+        fallback_lines(payload)
+    } else {
+        lines
+    }
 }
 
 fn render_trace(payload: &Payload) -> Vec<DetailLine> {
@@ -330,11 +432,7 @@ fn render_caller(payload: &Payload) -> Vec<DetailLine> {
     lines
 }
 
-fn push_frame_lines(
-    index: usize,
-    frame: &serde_json::Map<String, Value>,
-    lines: &mut Vec<DetailLine>,
-) {
+fn push_frame_lines(index: usize, frame: &Map<String, Value>, lines: &mut Vec<DetailLine>) {
     let class = frame
         .get("class")
         .and_then(|value| value.as_str())
@@ -412,6 +510,42 @@ fn push_frame_lines(
             segments: location_segments,
         });
     }
+}
+
+fn detail_key_value(label: &str, value: &str) -> DetailLine {
+    DetailLine {
+        indent: 0,
+        segments: vec![
+            DetailSegment {
+                text: format!("{}: ", label),
+                style: SegmentStyle::Key,
+            },
+            DetailSegment {
+                text: value.to_string(),
+                style: SegmentStyle::Plain,
+            },
+        ],
+    }
+}
+
+fn format_duration(value: &Value) -> Option<String> {
+    let number = value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|n| n as f64))?;
+    Some(format!("{:.3} ms", number))
+}
+
+fn format_bytes(value: &Value) -> Option<String> {
+    let mut bytes = value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|n| n as f64))?;
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut unit_index = 0;
+    while bytes >= 1024.0 && unit_index + 1 < units.len() {
+        bytes /= 1024.0;
+        unit_index += 1;
+    }
+    Some(format!("{:.2} {}", bytes, units[unit_index]))
 }
 
 fn render_html(label: Option<&str>, html: &str) -> Vec<DetailLine> {
@@ -704,12 +838,10 @@ fn extract_string(input: &str) -> Option<(String, usize)> {
 }
 
 fn sanitize_sf_dump(input: &str) -> String {
-    let upto_script = input
-        .find("<script")
-        .map(|idx| &input[..idx])
-        .unwrap_or(input);
+    let without_script = SF_SCRIPT_RE.replace_all(input, "");
+    let without_style = SF_STYLE_RE.replace_all(&without_script, "");
 
-    let mut sanitized = upto_script
+    let mut sanitized = without_style
         .replace("<br>", "\n")
         .replace("<br />", "\n")
         .replace("\r", "")
@@ -764,6 +896,10 @@ fn is_parenthesis_close(line: &str) -> bool {
 }
 
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
+static SF_SCRIPT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
+static SF_STYLE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap());
 static KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"^(\+?\[[^\]]+\]|\+["'][^"']+["']|[-+][\w$]+:)"#).unwrap());
 static TYPE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -1061,6 +1197,10 @@ fn parse_html_segments(line: &str) -> Vec<DetailSegment> {
 fn looks_like_html(input: &str) -> bool {
     let trimmed = input.trim();
     trimmed.starts_with('<') && trimmed.contains('>')
+}
+
+fn contains_sf_dump(input: &str) -> bool {
+    input.contains("sf-dump")
 }
 
 fn contains_image_tag(html: &str) -> bool {
