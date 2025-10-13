@@ -93,7 +93,7 @@ impl AppState {
         let outcome = inner.apply_payloads(&mut event);
 
         if matches!(outcome, ApplyOutcome::Record) {
-            inner.merge_previous_log_into_trace(&mut event);
+            inner.merge_previous_log_into_context(&mut event);
         }
 
         if matches!(outcome, ApplyOutcome::Skip) {
@@ -334,12 +334,12 @@ impl StateInner {
         outcome
     }
 
-    fn merge_previous_log_into_trace(&mut self, event: &mut TimelineEvent) {
+    fn merge_previous_log_into_context(&mut self, event: &mut TimelineEvent) {
         if !event
             .request
             .payloads
             .iter()
-            .any(|payload| matches!(payload.kind, PayloadKind::Trace))
+            .any(|payload| matches!(payload.kind, PayloadKind::Trace | PayloadKind::Caller))
         {
             return;
         }
@@ -363,6 +363,27 @@ fn extract_single_log_message(event: &TimelineEvent) -> Option<String> {
     let payload = event.request.payloads.first()?;
     if !matches!(payload.kind, PayloadKind::Log) {
         return None;
+    }
+
+    let clipboard = payload
+        .content_object()
+        .and_then(|map| map.get("meta"))
+        .and_then(|meta| meta.as_array())
+        .and_then(|items| {
+            items.iter().find_map(|meta| {
+                meta.as_object().and_then(|object| {
+                    object
+                        .get("clipboard_data")
+                        .and_then(|value| value.as_str())
+                        .map(|text| text.trim())
+                        .filter(|text| !text.is_empty())
+                        .map(|text| text.to_string())
+                })
+            })
+        });
+
+    if clipboard.is_some() {
+        return clipboard;
     }
 
     payload

@@ -62,6 +62,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         PayloadKind::Custom => render_custom(payload),
         PayloadKind::Label => render_label(payload),
         PayloadKind::Trace => render_trace(payload),
+        PayloadKind::Caller => render_caller(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
         _ => fallback_lines(payload),
     };
@@ -287,85 +288,10 @@ fn render_trace(payload: &Payload) -> Vec<DetailLine> {
     };
 
     for (index, frame) in frames.iter().enumerate() {
-        let class = frame
-            .get("class")
-            .and_then(|value| value.as_str())
-            .unwrap_or("(anonymous)")
-            .trim();
-        let method = frame
-            .get("method")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim();
-
-        let file = frame
-            .get("file_name")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let line_number = frame
-            .get("line_number")
-            .and_then(|value| value.as_i64())
-            .map(|number| number.to_string());
-
-        let vendor = frame
-            .get("vendor_frame")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-
-        let mut header_segments = Vec::new();
-        header_segments.push(DetailSegment {
-            text: format!("#{:<2} ", index + 1),
-            style: SegmentStyle::Plain,
-        });
-        header_segments.push(DetailSegment {
-            text: class.to_string(),
-            style: SegmentStyle::Key,
-        });
-        if !method.is_empty() {
-            header_segments.push(DetailSegment {
-                text: "::".to_string(),
-                style: SegmentStyle::Plain,
-            });
-            header_segments.push(DetailSegment {
-                text: method.to_string(),
-                style: SegmentStyle::Type,
-            });
+        if let Some(frame) = frame.as_object() {
+            push_frame_lines(index, frame, &mut lines);
+            lines.push(parse_plain_line(""));
         }
-        if vendor {
-            header_segments.push(DetailSegment {
-                text: " [vendor]".to_string(),
-                style: SegmentStyle::Boolean,
-            });
-        }
-        lines.push(DetailLine {
-            indent: 0,
-            segments: header_segments,
-        });
-
-        if let Some(file) = file {
-            let mut location_segments = Vec::new();
-            location_segments.push(DetailSegment {
-                text: file.to_string(),
-                style: SegmentStyle::String,
-            });
-            if let Some(line_number) = line_number {
-                location_segments.push(DetailSegment {
-                    text: ":".to_string(),
-                    style: SegmentStyle::Plain,
-                });
-                location_segments.push(DetailSegment {
-                    text: line_number,
-                    style: SegmentStyle::Number,
-                });
-            }
-            lines.push(DetailLine {
-                indent: 1,
-                segments: location_segments,
-            });
-        }
-
-        lines.push(parse_plain_line(""));
     }
 
     if let Some(last) = lines.last() {
@@ -376,6 +302,116 @@ fn render_trace(payload: &Payload) -> Vec<DetailLine> {
     }
 
     lines
+}
+
+fn render_caller(payload: &Payload) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+
+    if let Some(label) = payload
+        .content_string("label")
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        lines.push(parse_plain_line(&format!("Label: {}", label)));
+        lines.push(parse_plain_line(""));
+    }
+
+    let frame = payload
+        .content_object()
+        .and_then(|map| map.get("frame"))
+        .and_then(|value| value.as_object());
+
+    if let Some(frame) = frame {
+        push_frame_lines(0, frame, &mut lines);
+    } else {
+        return fallback_lines(payload);
+    }
+
+    lines
+}
+
+fn push_frame_lines(
+    index: usize,
+    frame: &serde_json::Map<String, Value>,
+    lines: &mut Vec<DetailLine>,
+) {
+    let class = frame
+        .get("class")
+        .and_then(|value| value.as_str())
+        .unwrap_or("(anonymous)")
+        .trim();
+    let method = frame
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let file = frame
+        .get("file_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let line_number = frame
+        .get("line_number")
+        .and_then(|value| value.as_i64())
+        .map(|number| number.to_string());
+
+    let vendor = frame
+        .get("vendor_frame")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    let mut header_segments = Vec::new();
+    header_segments.push(DetailSegment {
+        text: format!("#{:<2} ", index + 1),
+        style: SegmentStyle::Plain,
+    });
+    header_segments.push(DetailSegment {
+        text: class.to_string(),
+        style: SegmentStyle::Key,
+    });
+    if !method.is_empty() {
+        header_segments.push(DetailSegment {
+            text: "::".to_string(),
+            style: SegmentStyle::Plain,
+        });
+        header_segments.push(DetailSegment {
+            text: method.to_string(),
+            style: SegmentStyle::Type,
+        });
+    }
+    if vendor {
+        header_segments.push(DetailSegment {
+            text: " [vendor]".to_string(),
+            style: SegmentStyle::Boolean,
+        });
+    }
+    lines.push(DetailLine {
+        indent: 0,
+        segments: header_segments,
+    });
+
+    if let Some(file) = file {
+        let mut location_segments = Vec::new();
+        location_segments.push(DetailSegment {
+            text: file.to_string(),
+            style: SegmentStyle::String,
+        });
+        if let Some(line_number) = line_number {
+            location_segments.push(DetailSegment {
+                text: ":".to_string(),
+                style: SegmentStyle::Plain,
+            });
+            location_segments.push(DetailSegment {
+                text: line_number,
+                style: SegmentStyle::Number,
+            });
+        }
+        lines.push(DetailLine {
+            indent: 1,
+            segments: location_segments,
+        });
+    }
 }
 
 fn render_html(label: Option<&str>, html: &str) -> Vec<DetailLine> {
