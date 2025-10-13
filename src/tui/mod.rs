@@ -15,7 +15,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -23,6 +23,15 @@ use ratatui::{
 use tokio::{sync::mpsc, task};
 use tracing::{debug, error};
 use uuid::Uuid;
+
+static RAYGUN_BANNER: &[&str] = &[
+    "██████╗  █████╗ ██╗   ██╗ ██████╗ ██╗   ██╗███╗   ██╗",
+    "██╔══██╗██╔══██╗╚██╗ ██╔╝██╔════╝ ██║   ██║████╗  ██║",
+    "██████╔╝███████║ ╚████╔╝ ██║  ███╗██║   ██║██╔██╗ ██║",
+    "██╔══██╗██╔══██║  ╚██╔╝  ██║   ██║██║   ██║██║╚██╗██║",
+    "██║  ██║██║  ██║   ██║   ╚██████╔╝╚██████╔╝██║ ╚████║",
+    "╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝",
+];
 
 #[derive(Debug)]
 pub enum Event {
@@ -166,7 +175,7 @@ pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Percentage(view_model.layout.timeline_percent),
             Constraint::Percentage(view_model.layout.detail_percent),
             Constraint::Length(2),
@@ -231,23 +240,7 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
     }
 
     if view_model.timeline.is_empty() {
-        let message = if let Some(filter) = &view_model.active_color_filter {
-            format!(
-                "No payloads match color filter `{}`.\nPress `f` to clear the filter.",
-                filter
-            )
-        } else {
-            format!(
-                "Waiting for Ray payloads…\n\nUse the PHP `ray()` helper to send data here.\nListening on {}.\nPress `q` to exit.",
-                view_model.bind_addr
-            )
-        };
-
-        let content = Paragraph::new(message)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Gray));
-
-        frame.render_widget(content, inner_area);
+        EmptyTimelineMessage::new(view_model).render(frame, inner_area);
         return;
     }
 
@@ -288,9 +281,36 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel)
                 text_style = text_style.patch(style);
             }
 
-            let bullet_span = Span::styled("⬤", bullet_style);
-            let text = format!("[{}] {} · {}", entry.kind, entry.summary, entry.age);
-            let mut spans = vec![bullet_span, Span::raw(" "), Span::styled(text, text_style)];
+            let mut spans = Vec::new();
+            spans.push(Span::styled("⬤", bullet_style));
+            spans.push(Span::raw(" "));
+
+            let mut bracket_style = text_style;
+            let mut kind_style = Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD);
+            if let Some(style) = highlight_style {
+                bracket_style = bracket_style.patch(style);
+                kind_style = kind_style.patch(style);
+            }
+
+            spans.push(Span::styled("[", bracket_style));
+            spans.push(Span::styled(entry.kind.clone(), kind_style));
+            spans.push(Span::styled("] ", bracket_style));
+
+            spans.push(Span::styled(entry.summary.clone(), text_style));
+
+            let mut separator_style = text_style;
+            if let Some(style) = highlight_style {
+                separator_style = separator_style.patch(style);
+            }
+            spans.push(Span::styled(" · ", separator_style));
+
+            let mut age_style = Style::default().fg(Color::DarkGray);
+            if let Some(style) = highlight_style {
+                age_style = age_style.patch(style);
+            }
+            spans.push(Span::styled(entry.age.clone(), age_style));
 
             if let Some(label) = entry.label.as_deref() {
                 let mut label_style = Style::default().fg(Color::DarkGray);
@@ -416,6 +436,61 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, view_model: &AppViewModel) {
         let paragraph =
             Paragraph::new("No event selected").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(paragraph, inner_area);
+    }
+}
+
+struct EmptyTimelineMessage<'a> {
+    view_model: &'a AppViewModel,
+}
+
+impl<'a> EmptyTimelineMessage<'a> {
+    fn new(view_model: &'a AppViewModel) -> Self {
+        Self { view_model }
+    }
+
+    fn render(self, frame: &mut Frame<'_>, area: Rect) {
+        let mut lines: Vec<Line> = std::iter::once(Line::default())
+            .chain(RAYGUN_BANNER.iter().map(|line| {
+                Line::styled(
+                    *line,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }))
+            .collect();
+
+        lines.push(Line::default());
+
+        if let Some(filter) = &self.view_model.active_color_filter {
+            lines.push(Line::from(vec![Span::styled(
+                format!("No payloads match color filter `{}`.", filter),
+                Style::default().fg(Color::Gray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "Press `f` to clear the filter or send a payload.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                format!("Listening on {}", self.view_model.bind_addr),
+                Style::default().fg(Color::Gray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "Use the `ray()` helper to send data here.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "Press `q` to exit.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(paragraph, area);
     }
 }
 

@@ -69,6 +69,7 @@ impl Default for AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new(retention: usize) -> Self {
         Self::with_debug_logger(retention, None)
     }

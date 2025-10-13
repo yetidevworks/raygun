@@ -548,6 +548,46 @@ fn format_bytes(value: &Value) -> Option<String> {
     Some(format!("{:.2} {}", bytes, units[unit_index]))
 }
 
+fn json_value_preview(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Null => "null".to_string(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn ordered_map_entries<'a>(map: &'a Map<String, Value>) -> Vec<(&'a str, &'a Value)> {
+    let priority = [
+        "PHP version",
+        "PHP ini file",
+        "PHP scanned ini file",
+        "Memory limit",
+        "Max post size",
+        "Max file upload size",
+        "Extensions",
+    ];
+
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut ordered = Vec::new();
+
+    for key in &priority {
+        if let Some(value) = map.get(*key) {
+            ordered.push((*key, value));
+            seen.insert(*key);
+        }
+    }
+
+    for (key, value) in map {
+        if !seen.contains(key.as_str()) {
+            ordered.push((key.as_str(), value));
+        }
+    }
+
+    ordered
+}
+
 fn render_html(label: Option<&str>, html: &str) -> Vec<DetailLine> {
     let mut lines = Vec::new();
 
@@ -612,28 +652,51 @@ fn render_table(payload: &Payload) -> Vec<DetailLine> {
         None => return fallback_lines(payload),
     };
 
-    let values = match content.get("values").and_then(|value| value.as_array()) {
-        Some(values) => values,
-        None => return fallback_lines(payload),
-    };
+    if let Some(values) = content.get("values").and_then(|value| value.as_array()) {
+        if let Some(model) = values
+            .iter()
+            .find_map(|value| value.as_str().and_then(TableModel::from_html))
+        {
+            return render_table_model(payload, model);
+        }
 
-    if let Some(model) = values
-        .iter()
-        .find_map(|value| value.as_str().and_then(TableModel::from_html))
-    {
-        return render_table_model(payload, model);
+        if values.is_empty() {
+            return vec![parse_plain_line("(empty table)")];
+        }
+
+        if let Some(table) = TableModel::from_values(values) {
+            return render_table_model(payload, table);
+        }
+
+        return fallback_lines(payload);
     }
 
-    if values.is_empty() {
-        return vec![parse_plain_line("(empty table)")];
+    if let Some(map) = content.get("values").and_then(|value| value.as_object()) {
+        let mut lines = Vec::new();
+
+        if let Some(label) = content
+            .get("label")
+            .and_then(|value| value.as_str())
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+        {
+            lines.push(parse_plain_line(&format!("Label: {}", label)));
+            lines.push(parse_plain_line(""));
+        }
+
+        let ordered = ordered_map_entries(map);
+        for (key, value) in ordered {
+            lines.push(detail_key_value(key, &json_value_preview(value)));
+        }
+
+        if lines.is_empty() {
+            return fallback_lines(payload);
+        }
+
+        return lines;
     }
 
-    let table = match TableModel::from_values(values) {
-        Some(table) => table,
-        None => return fallback_lines(payload),
-    };
-
-    render_table_model(payload, table)
+    fallback_lines(payload)
 }
 
 fn render_table_model(payload: &Payload, table: TableModel) -> Vec<DetailLine> {
