@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap},
 };
 use tokio::{sync::mpsc, task};
 use tracing::{debug, error};
@@ -571,7 +571,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     lines.push(Line::from(vec![
         Span::styled("Global: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(
-            "f cycle color filter · ctrl+k clear timeline · ctrl+d raw payload · ? close help · q quit · Ctrl+C force quit",
+            "f cycle color filter · ctrl+k clear timeline · ctrl+d raw payload · Esc closes overlays · ? close help · q quit · Ctrl+C force quit",
         ),
     ]));
 
@@ -597,10 +597,17 @@ fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
         "Tips: use `f` repeatedly to cycle colors; when no color matches the filter, the timeline shows a hint.",
     ));
 
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("About: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("Raygun CLI · https://github.com/yetidevworks/raygun · MIT License"),
+    ]));
+
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
         Block::default()
             .borders(Borders::ALL)
             .title("Help")
+            .padding(Padding::uniform(1))
             .border_style(Style::default().fg(Color::Cyan)),
     );
 
@@ -613,7 +620,8 @@ fn render_debug_overlay(frame: &mut Frame<'_>, json: &str, scroll: usize) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Raw Payload (Ctrl+D to close)")
+        .title("Raw Payload (Ctrl+D or Esc to close)")
+        .padding(Padding::uniform(1))
         .border_style(Style::default().fg(Color::Magenta));
 
     let paragraph = Paragraph::new(json.to_string())

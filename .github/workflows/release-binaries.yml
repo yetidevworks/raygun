@@ -1,0 +1,246 @@
+name: Release binary tap (mac arm64 + linux)
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            target_name: macos-arm64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            target_name: linux-x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            target_name: linux-aarch64
+            use_cross: true
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            target_name: linux-armv7
+            use_cross: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            target_name: linux-x86_64-musl
+            use_cross: true
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            target_name: linux-aarch64-musl
+            use_cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse version from tag
+        id: v
+        run: |
+          RAW_TAG="${GITHUB_REF_NAME}"
+          echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux build deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake nasm zlib1g-dev meson ninja-build python3
+
+      - name: Install cross for cross-compilation
+        if: matrix.use_cross == true
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: macOS build deps
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew update
+          brew install meson ninja nasm pkg-config
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          VER='${{ steps.v.outputs.version }}'
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              BIN="target/aarch64-apple-darwin/release/raygun"; OUT="raygun-${VER}-darwin-arm64.tar.gz";;
+            x86_64-unknown-linux-gnu)
+              BIN="target/x86_64-unknown-linux-gnu/release/raygun"; OUT="raygun-${VER}-linux-x86_64.tar.gz";;
+            aarch64-unknown-linux-gnu)
+              BIN="target/aarch64-unknown-linux-gnu/release/raygun"; OUT="raygun-${VER}-linux-aarch64.tar.gz";;
+            armv7-unknown-linux-gnueabihf)
+              BIN="target/armv7-unknown-linux-gnueabihf/release/raygun"; OUT="raygun-${VER}-linux-armv7.tar.gz";;
+            x86_64-unknown-linux-musl)
+              BIN="target/x86_64-unknown-linux-musl/release/raygun"; OUT="raygun-${VER}-linux-x86_64-musl.tar.gz";;
+            aarch64-unknown-linux-musl)
+              BIN="target/aarch64-unknown-linux-musl/release/raygun"; OUT="raygun-${VER}-linux-aarch64-musl.tar.gz";;
+          esac
+          mkdir -p package
+          cp "$BIN" package/raygun
+          chmod +x package/raygun
+          tar -C package -czf "$OUT" raygun
+          if command -v shasum >/dev/null; then
+            SHA=$(shasum -a 256 "$OUT" | awk '{print $1}')
+          else
+            SHA=$(sha256sum "$OUT" | awk '{print $1}')
+          fi
+          echo "file=$OUT" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" "${{ steps.pkg.outputs.file }}" --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Publish archive as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target_name }}
+          path: ${{ steps.pkg.outputs.file }}
+
+  update-formula:
+    name: Update tap formula
+    needs: build
+    runs-on: ubuntu-22.04
+    env:
+      FORMULA_PATH: homebrew/Formula/raygun.rb
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download artifacts (archives)
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Compute shas
+        id: shas
+        run: |
+          set -euo pipefail
+          hash() { if command -v shasum >/dev/null; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi }
+
+          f=$(find /tmp/artifacts -name '*darwin-arm64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "darwin_arm64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-x86_64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-aarch64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_aarch64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-armv7.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_armv7_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-x86_64-musl.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_x86_64_musl_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-aarch64-musl.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_aarch64_musl_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+      - name: Parse version from tag
+        id: v
+        run: |
+          RAW_TAG="${GITHUB_REF_NAME}"
+          echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Write formula
+        run: |
+          set -euo pipefail
+          VER='${{ steps.v.outputs.version }}'
+          TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          DARWIN_SHA='${{ steps.shas.outputs.darwin_arm64_sha }}'
+          LINUX_X86_64_SHA='${{ steps.shas.outputs.linux_x86_64_sha }}'
+          LINUX_AARCH64_SHA='${{ steps.shas.outputs.linux_aarch64_sha }}'
+
+          if [[ -z "${DARWIN_SHA}" || -z "${LINUX_X86_64_SHA}" || -z "${LINUX_AARCH64_SHA}" ]]; then
+            echo "Missing required SHAs for Homebrew formula." >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "${FORMULA_PATH}")"
+          cat <<EOF > "${FORMULA_PATH}"
+# Additional binaries available for direct download:
+# - Linux ARMv7 (32-bit ARM): raygun-${VER}-linux-armv7.tar.gz
+# - Linux x86_64 musl (Alpine/static): raygun-${VER}-linux-x86_64-musl.tar.gz
+# - Linux ARM64 musl (Alpine/static): raygun-${VER}-linux-aarch64-musl.tar.gz
+# Download from: ${TAP_URL}/
+
+class Raygun < Formula
+  desc "Raygun CLI"
+  homepage "https://github.com/${GITHUB_REPOSITORY}"
+  license :cannot_represent
+
+  on_macos do
+    on_arm do
+      url "${TAP_URL}/raygun-${VER}-darwin-arm64.tar.gz"
+      sha256 "${DARWIN_SHA}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "${TAP_URL}/raygun-${VER}-linux-x86_64.tar.gz"
+      sha256 "${LINUX_X86_64_SHA}"
+    end
+    on_arm do
+      url "${TAP_URL}/raygun-${VER}-linux-aarch64.tar.gz"
+      sha256 "${LINUX_AARCH64_SHA}"
+    end
+  end
+
+  def install
+    bin.install "raygun"
+  end
+
+  test do
+    assert_match "raygun", shell_output("#{bin}/raygun --version")
+  end
+end
+EOF
+
+      - name: Commit & push
+        run: |
+          set -euo pipefail
+          git checkout "${DEFAULT_BRANCH}"
+          git pull --ff-only origin "${DEFAULT_BRANCH}"
+          git add "${FORMULA_PATH}"
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+          git config user.name "raygun-bot"
+          git config user.email "raygun-bot@users.noreply.github.com"
+          git commit -m "raygun ${GITHUB_REF_NAME#v}: update Homebrew formula"
+          git push origin HEAD:"${DEFAULT_BRANCH}"

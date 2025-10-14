@@ -26,7 +26,7 @@ timeline list.
    `Tab` to focus the details pane (same keys to scroll) and `Ctrl+L` to cycle
    layout presets. While on the details pane use `Enter`/`→` to expand, `←` to
    collapse, and `Space` to toggle. `Ctrl+K` clears the timeline, `Ctrl+D`
-   toggles the raw payload viewer, `f` cycles the color filter, `?` opens the
-   help overlay, and you can quit with `q` or `Ctrl+C`.
+   toggles the raw payload viewer, `f` cycles the color filter, `Esc` closes the
+   overlays, `?` opens the help overlay, and you can quit with `q` or `Ctrl+C`.
 3. If the port is already in use, Raygun fails to bind; choose another port via
    `--bind 127.0.0.1:23518` while testing.

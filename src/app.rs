@@ -279,7 +279,8 @@ impl RaygunApp {
                         KeyCode::Char('q')
                         | KeyCode::Char('Q')
                         | KeyCode::Enter
-                        | KeyCode::Char('?') => {
+                        | KeyCode::Char('?')
+                        | KeyCode::Esc => {
                             self.show_help = false;
                             false
                         }
@@ -295,7 +296,7 @@ impl RaygunApp {
                             self.debug_scroll = 0;
                             false
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Enter | KeyCode::Esc => {
                             self.show_debug = false;
                             self.debug_scroll = 0;
                             false

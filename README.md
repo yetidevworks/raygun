@@ -57,3 +57,7 @@ list below shows the formatting that is currently implemented:
 If a payload type you use is not formatting nicely yet, capture it with
 `--debug-dump` and open an issue (or PR!) with the emitted payload so we can
 add specialised rendering.
+
+## License
+
+Raygun is released under the [MIT License](LICENSE). Copyright © 2025 Andy Miller.
