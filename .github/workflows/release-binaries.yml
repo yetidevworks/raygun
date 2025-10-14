@@ -6,6 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  TAP_REPO: yetidevworks/homebrew-raygun
 
 permissions:
   contents: write
@@ -131,15 +132,8 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     env:
-      FORMULA_PATH: homebrew/Formula/raygun.rb
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      FORMULA_PATH: Formula/raygun.rb
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.repository.default_branch }}
-
       - name: Download artifacts (archives)
         uses: actions/download-artifact@v4
         with:
@@ -176,6 +170,8 @@ jobs:
           echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Write formula
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
         run: |
           set -euo pipefail
           VER='${{ steps.v.outputs.version }}'
@@ -188,59 +184,64 @@ jobs:
             echo "Missing required SHAs for Homebrew formula." >&2
             exit 1
           fi
-
+          
+          rm -rf tap
+          git clone "https://${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          
+          cd tap
           mkdir -p "$(dirname "${FORMULA_PATH}")"
-          cat <<EOF | sed 's/^          //' > "${FORMULA_PATH}"
-          # Additional binaries available for direct download:
-          # - Linux ARMv7 (32-bit ARM): raygun-${VER}-linux-armv7.tar.gz
-          # - Linux x86_64 musl (Alpine/static): raygun-${VER}-linux-x86_64-musl.tar.gz
-          # - Linux ARM64 musl (Alpine/static): raygun-${VER}-linux-aarch64-musl.tar.gz
-          # Download from: ${TAP_URL}/
-          
-          class Raygun < Formula
-            desc "Raygun CLI"
-            homepage "https://github.com/${GITHUB_REPOSITORY}"
-            license :cannot_represent
-          
-            on_macos do
-              on_arm do
-                url "${TAP_URL}/raygun-${VER}-darwin-arm64.tar.gz"
-                sha256 "${DARWIN_SHA}"
-              end
-            end
-          
-            on_linux do
-              on_intel do
-                url "${TAP_URL}/raygun-${VER}-linux-x86_64.tar.gz"
-                sha256 "${LINUX_X86_64_SHA}"
-              end
-              on_arm do
-                url "${TAP_URL}/raygun-${VER}-linux-aarch64.tar.gz"
-                sha256 "${LINUX_AARCH64_SHA}"
-              end
-            end
-          
-            def install
-              bin.install "raygun"
-            end
-          
-            test do
-              assert_match "raygun", shell_output("#{bin}/raygun --version")
-            end
-          end
-          EOF
+          cat <<EOF > "${FORMULA_PATH}"
+# Additional binaries available for direct download:
+# - Linux ARMv7 (32-bit ARM): raygun-${VER}-linux-armv7.tar.gz
+# - Linux x86_64 musl (Alpine/static): raygun-${VER}-linux-x86_64-musl.tar.gz
+# - Linux ARM64 musl (Alpine/static): raygun-${VER}-linux-aarch64-musl.tar.gz
+# Download from: ${TAP_URL}/
+
+class Raygun < Formula
+  desc "Raygun CLI"
+  homepage "https://github.com/${GITHUB_REPOSITORY}"
+  license :cannot_represent
+
+  on_macos do
+    on_arm do
+      url "${TAP_URL}/raygun-${VER}-darwin-arm64.tar.gz"
+      sha256 "${DARWIN_SHA}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "${TAP_URL}/raygun-${VER}-linux-x86_64.tar.gz"
+      sha256 "${LINUX_X86_64_SHA}"
+    end
+    on_arm do
+      url "${TAP_URL}/raygun-${VER}-linux-aarch64.tar.gz"
+      sha256 "${LINUX_AARCH64_SHA}"
+    end
+  end
+
+  def install
+    bin.install "raygun"
+  end
+
+  test do
+    assert_match "raygun", shell_output("#{bin}/raygun --version")
+  end
+end
+EOF
 
       - name: Commit & push
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          git checkout "${DEFAULT_BRANCH}"
-          git pull --ff-only origin "${DEFAULT_BRANCH}"
+          cd tap
+          git config user.name "raygun-bot"
+          git config user.email "raygun-bot@users.noreply.github.com"
           git add "${FORMULA_PATH}"
           if git diff --cached --quiet; then
             echo "No formula changes to commit."
             exit 0
           fi
-          git config user.name "raygun-bot"
-          git config user.email "raygun-bot@users.noreply.github.com"
           git commit -m "raygun ${GITHUB_REF_NAME#v}: update Homebrew formula"
-          git push origin HEAD:"${DEFAULT_BRANCH}"
+          git push "https://${GH_TOKEN}@github.com/${TAP_REPO}.git" HEAD:main
