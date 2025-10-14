@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "raygun"
-version = "1.0.0"
+version = "1.0.3"
 dependencies = [
  "axum",
  "clap",

@@ -38,6 +38,9 @@ By default Raygun listens on `0.0.0.0:23517`. You can change the bind address
 with `--bind <addr>` (or via `RAYGUN_BIND`). See `docs/running.md` for more CLI
 options and keyboard shortcuts.
 
+### Mouse support
+
+Raygun listens for basic mouse events when your terminal forwards them (iTerm2, Kitty, WezTerm, etc.). Click timeline entries to select them, click inside the detail pane to move the cursor, and use the `+/-` glyph to expand or collapse nested values. Clicking anywhere inside the help or raw-payload overlays closes them. Most terminals require mouse reporting to be enabled; in iTerm2 this lives under **Profiles › Advanced › Mouse Reporting**.
 
 ## Supported payloads
 

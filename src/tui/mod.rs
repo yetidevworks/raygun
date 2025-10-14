@@ -8,7 +8,10 @@ use std::{
 use crate::ui::detail::{self, DetailSegment, DetailViewModel, SegmentStyle};
 use color_eyre::Result;
 use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyEvent},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyEvent,
+        MouseEvent,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -38,6 +41,7 @@ pub enum Event {
     Input(KeyEvent),
     Tick,
     Resize(u16, u16),
+    Mouse(MouseEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +92,7 @@ impl TerminalGuard {
     pub fn new() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
@@ -96,12 +100,15 @@ impl TerminalGuard {
         Ok(Self { terminal })
     }
 
-    pub fn draw<F>(&mut self, f: F) -> Result<()>
+    pub fn draw<F, R>(&mut self, f: F) -> Result<R>
     where
-        F: FnOnce(&mut Frame<'_>),
+        F: FnOnce(&mut Frame<'_>) -> R,
     {
-        self.terminal.draw(f)?;
-        Ok(())
+        let mut result = None;
+        self.terminal.draw(|frame| {
+            result = Some(f(frame));
+        })?;
+        Ok(result.expect("terminal draw closure did not produce a result"))
     }
 }
 
@@ -112,7 +119,7 @@ impl Drop for TerminalGuard {
         }
 
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, LeaveAlternateScreen) {
+        if let Err(err) = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen) {
             error!(?err, "failed to leave alternate screen");
         }
 
@@ -120,6 +127,19 @@ impl Drop for TerminalGuard {
             error!(?err, "failed to show cursor");
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AppRenderMetadata {
+    pub timeline_inner: Rect,
+    pub detail_inner: Rect,
+    pub overlay: Option<OverlayArea>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OverlayArea {
+    Help(Rect),
+    Debug(Rect),
 }
 
 pub fn spawn_event_loop(
@@ -138,6 +158,11 @@ pub fn spawn_event_loop(
                 Ok(true) => match event::read() {
                     Ok(CrosstermEvent::Key(key)) => {
                         if tx.send(Event::Input(key)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(CrosstermEvent::Mouse(mouse)) => {
+                        if tx.send(Event::Mouse(mouse)).is_err() {
                             break;
                         }
                     }
@@ -171,7 +196,8 @@ pub fn spawn_event_loop(
     })
 }
 
-pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
+pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) -> AppRenderMetadata {
+    let frame_rect = frame.size();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -180,17 +206,28 @@ pub fn render_app(frame: &mut Frame<'_>, view_model: &AppViewModel) {
             Constraint::Percentage(view_model.layout.detail_percent),
             Constraint::Length(2),
         ])
-        .split(frame.size());
+        .split(frame_rect);
 
     render_header(frame, layout[0], view_model);
     render_timeline(frame, layout[1], view_model);
     render_detail(frame, layout[2], view_model);
     render_footer(frame, layout[3]);
 
+    let mut overlay = None;
     if view_model.show_help {
-        render_help_overlay(frame, view_model);
+        let area = centered_rect(80, 70, frame_rect);
+        render_help_overlay(frame, view_model, area);
+        overlay = Some(OverlayArea::Help(area));
     } else if let Some(json) = view_model.debug_json.as_deref() {
-        render_debug_overlay(frame, json, view_model.debug_scroll);
+        let area = centered_rect(90, 80, frame_rect);
+        render_debug_overlay(frame, json, view_model.debug_scroll, area);
+        overlay = Some(OverlayArea::Debug(area));
+    }
+
+    AppRenderMetadata {
+        timeline_inner: inner(layout[1]),
+        detail_inner: inner(layout[2]),
+        overlay,
     }
 }
 
@@ -545,8 +582,7 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
-    let area = centered_rect(80, 70, frame.size());
+fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel, area: Rect) {
     frame.render_widget(Clear, area);
 
     let mut lines = Vec::new();
@@ -614,8 +650,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, view_model: &AppViewModel) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_debug_overlay(frame: &mut Frame<'_>, json: &str, scroll: usize) {
-    let area = centered_rect(90, 80, frame.size());
+fn render_debug_overlay(frame: &mut Frame<'_>, json: &str, scroll: usize, area: Rect) {
     frame.render_widget(Clear, area);
 
     let block = Block::default()

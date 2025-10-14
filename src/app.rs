@@ -10,9 +10,10 @@ use color_eyre::{
     Result,
     eyre::{Report, eyre},
 };
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use html_escape::decode_html_entities;
 use once_cell::sync::Lazy;
+use ratatui::layout::Rect;
 use regex::Regex;
 use serde_json::{Number, Value};
 use tokio::{select, sync::mpsc};
@@ -23,7 +24,10 @@ use crate::{
     protocol::{Origin, Payload, PayloadKind},
     server,
     state::{AppState, PayloadLogger, TimelineEvent},
-    tui::{self, AppViewModel, DetailStateView, Event, LayoutConfig, TerminalGuard, TimelineEntry},
+    tui::{
+        self, AppRenderMetadata, AppViewModel, DetailStateView, Event, LayoutConfig, OverlayArea,
+        TerminalGuard, TimelineEntry,
+    },
     ui::detail::{self, build_detail_view},
 };
 use uuid::Uuid;
@@ -44,6 +48,7 @@ pub struct RaygunApp {
     show_help: bool,
     show_debug: bool,
     debug_scroll: usize,
+    last_render: Option<AppRenderMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +93,7 @@ impl RaygunApp {
             show_help: false,
             show_debug: false,
             debug_scroll: 0,
+            last_render: None,
         })
     }
 
@@ -110,7 +116,8 @@ impl RaygunApp {
                     .map(|state| &state.collapsed),
             );
 
-            terminal.draw(|frame| tui::render_app(frame, &view_model))?;
+            let render_info = terminal.draw(|frame| tui::render_app(frame, &view_model))?;
+            self.last_render = Some(render_info);
 
             let exit_requested = select! {
                 maybe_event = rx.recv() => {
@@ -500,12 +507,162 @@ impl RaygunApp {
                     _ => false,
                 }
             }
+            Event::Mouse(mouse) => self.handle_mouse_event(mouse, timeline_len, detail_ctx),
             Event::Tick => false,
             Event::Resize(width, height) => {
                 debug!(%width, %height, "terminal resized");
                 false
             }
         }
+    }
+
+    fn handle_mouse_event(
+        &mut self,
+        mouse: MouseEvent,
+        timeline_len: usize,
+        detail_ctx: &DetailContext,
+    ) -> bool {
+        let Some(layout) = self.last_render else {
+            return false;
+        };
+
+        let point_in_rect = |rect: Rect| -> bool {
+            if rect.width == 0 || rect.height == 0 {
+                return false;
+            }
+
+            let min_x = rect.x;
+            let max_x = rect.x.saturating_add(rect.width.saturating_sub(1));
+            let min_y = rect.y;
+            let max_y = rect.y.saturating_add(rect.height.saturating_sub(1));
+
+            mouse.column >= min_x
+                && mouse.column <= max_x
+                && mouse.row >= min_y
+                && mouse.row <= max_y
+        };
+
+        if let Some(overlay) = layout.overlay {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                let area = match overlay {
+                    OverlayArea::Help(area) | OverlayArea::Debug(area) => area,
+                };
+                if point_in_rect(area) {
+                    match overlay {
+                        OverlayArea::Help(_) => {
+                            self.show_help = false;
+                        }
+                        OverlayArea::Debug(_) => {
+                            self.show_debug = false;
+                            self.debug_scroll = 0;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+
+        if point_in_rect(layout.timeline_inner) && timeline_len > 0 {
+            let inner = layout.timeline_inner;
+            let relative_row = mouse.row.saturating_sub(inner.y) as usize;
+            if relative_row < inner.height as usize {
+                let view_height = inner.height as usize;
+                let selected = self.selected.unwrap_or(0);
+                let total = timeline_len;
+                let max_start = total.saturating_sub(view_height);
+                let start = selected
+                    .saturating_sub(view_height.saturating_sub(1))
+                    .min(max_start);
+                let target = start + relative_row;
+                if target < total {
+                    self.store_detail_state(detail_ctx.visible_len());
+                    self.focus = Focus::Timeline;
+                    self.selected = Some(target);
+                    if let Some(state) = self.current_detail_state() {
+                        self.detail_scroll = state.scroll;
+                    } else {
+                        self.detail_scroll = 0;
+                    }
+                }
+            }
+            return false;
+        }
+
+        if point_in_rect(layout.detail_inner) {
+            let detail = match detail_ctx.detail {
+                Some(detail) => detail,
+                None => return false,
+            };
+
+            if detail_ctx.visible_len() == 0 {
+                return false;
+            }
+
+            let inner = layout.detail_inner;
+            let relative_row = mouse.row.saturating_sub(inner.y) as usize;
+            if relative_row >= inner.height as usize {
+                return false;
+            }
+
+            let line_index = self.detail_scroll.saturating_add(relative_row);
+
+            let mut header_offset = 0;
+            if !detail.header.is_empty() {
+                header_offset = 2; // header + blank spacer
+            }
+
+            if line_index < header_offset {
+                self.focus = Focus::Detail;
+                return false;
+            }
+
+            let detail_position = line_index - header_offset;
+            if detail_position >= detail_ctx.visible_len() {
+                self.focus = Focus::Detail;
+                return false;
+            }
+
+            let max = detail_ctx.visible_len().saturating_sub(1);
+            let new_cursor = detail_position.min(max);
+            let new_scroll = self.detail_scroll.min(max);
+            if let Some(state) = self.current_detail_state_mut() {
+                state.cursor = new_cursor;
+                state.scroll = new_scroll;
+            }
+
+            self.detail_scroll = new_scroll;
+
+            self.focus = Focus::Detail;
+
+            let line_index_actual = detail_ctx.visible_indices[detail_position];
+            let has_children = detail_ctx
+                .has_children
+                .get(line_index_actual)
+                .copied()
+                .unwrap_or(false);
+
+            if has_children {
+                let detail_line = &detail.lines[line_index_actual];
+                let indent_width = detail_line.indent.saturating_mul(2) as usize;
+                let icon_width = 2usize;
+                let relative_col = mouse.column.saturating_sub(inner.x) as usize;
+
+                if relative_col < indent_width + icon_width {
+                    if self.toggle_current_node(detail_ctx) {
+                        self.store_detail_state(detail_ctx.visible_len());
+                    }
+                    return false;
+                }
+            }
+
+            return false;
+        }
+
+        false
     }
 
     fn move_selection(&mut self, delta: i32, len: usize) -> Option<usize> {
