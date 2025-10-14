@@ -5,6 +5,18 @@ Raygun is a terminal-based receiver for payloads sent with the
 ecosystems. It implements the same HTTP interface as the desktop Ray app and
 renders payloads inside a fast TUI (terminal UI).
 
+## Installation
+
+Install the latest release on macOS or Linux via Homebrew (no manual tap
+needed):
+
+```bash
+brew install yetidevworks/raygun/raygun
+```
+
+You can also download platform-specific archives from the
+[Releases](https://github.com/yetidevworks/raygun/releases) page.
+
 ## Running the CLI
 
 Build and run Raygun directly with Cargo:
