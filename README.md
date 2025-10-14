@@ -1,15 +1,12 @@
 # Raygun (terminal Ray client)
 
+Raygun is a terminal-based receiver for payloads sent with Spatie's amazing **Ray** debugger package for [PHP](https://myray.app/docs/php/vanilla-php/installation), [Grav](https://github.com/trilbymedia/grav-plugin-grav-ray), [Laravel](https://myray.app/docs/php/laravel/installation), and other ecosystems. It implements the same HTTP interface as the [Desktop Ray App](https://myray.app/), but renders payloads inside a fast rust-based TUI.
+
 ![Raygun](docs/raygun-intro.png)
 
 ![Raygun](docs/raygun.png)
 
-Raygun is a terminal-based receiver for payloads sent with the
-[`ray()` helper](https://spatie.be/docs/ray/) from PHP, Laravel, and other
-ecosystems. It implements the same HTTP interface as the desktop Ray app and
-renders payloads inside a fast TUI (terminal UI).
-
-## Installation
+## Installation via Homebrew
 
 Install the latest release on macOS or Linux via Homebrew (no manual tap
 needed):
@@ -21,23 +18,26 @@ brew install yetidevworks/raygun/raygun
 You can also download platform-specific archives from the
 [Releases](https://github.com/yetidevworks/raygun/releases) page.
 
-## Running the CLI
+## Compiling via source
 
-Build and run Raygun directly with Cargo:
+You can build and compile the app:
 
 ```bash
 cargo run
 ```
-
-By default Raygun listens on `0.0.0.0:23517`. You can change the bind address
-with `--bind <addr>` (or via `RAYGUN_BIND`). See `docs/running.md` for more CLI
-options and keyboard shortcuts.
 
 While developing it is handy to persist every incoming request:
 
 ```bash
 cargo run -- --debug-dump payloads.log
 ```
+
+## Running the CLI
+
+By default Raygun listens on `0.0.0.0:23517`. You can change the bind address
+with `--bind <addr>` (or via `RAYGUN_BIND`). See `docs/running.md` for more CLI
+options and keyboard shortcuts.
+
 
 ## Supported payloads
 
@@ -71,7 +71,7 @@ list below shows the formatting that is currently implemented:
   matching the desktop Ray behaviour.
 
 If a payload type you use is not formatting nicely yet, capture it with
-`--debug-dump` and open an issue (or PR!) with the emitted payload so we can
+`--debug-dump` and open an issue (or Pull Request!) with the emitted payload so we can
 add specialised rendering.
 
 ## License
