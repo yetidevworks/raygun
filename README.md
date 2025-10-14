@@ -1,5 +1,9 @@
 # Raygun (terminal Ray client)
 
+![Raygun](docs/raygun-intro.png)
+
+![Raygun](docs/raygun.png)
+
 Raygun is a terminal-based receiver for payloads sent with the
 [`ray()` helper](https://spatie.be/docs/ray/) from PHP, Laravel, and other
 ecosystems. It implements the same HTTP interface as the desktop Ray app and
