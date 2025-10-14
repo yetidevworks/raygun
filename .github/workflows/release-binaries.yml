@@ -190,45 +190,45 @@ jobs:
           fi
 
           mkdir -p "$(dirname "${FORMULA_PATH}")"
-          cat <<EOF > "${FORMULA_PATH}"
-# Additional binaries available for direct download:
-# - Linux ARMv7 (32-bit ARM): raygun-${VER}-linux-armv7.tar.gz
-# - Linux x86_64 musl (Alpine/static): raygun-${VER}-linux-x86_64-musl.tar.gz
-# - Linux ARM64 musl (Alpine/static): raygun-${VER}-linux-aarch64-musl.tar.gz
-# Download from: ${TAP_URL}/
-
-class Raygun < Formula
-  desc "Raygun CLI"
-  homepage "https://github.com/${GITHUB_REPOSITORY}"
-  license :cannot_represent
-
-  on_macos do
-    on_arm do
-      url "${TAP_URL}/raygun-${VER}-darwin-arm64.tar.gz"
-      sha256 "${DARWIN_SHA}"
-    end
-  end
-
-  on_linux do
-    on_intel do
-      url "${TAP_URL}/raygun-${VER}-linux-x86_64.tar.gz"
-      sha256 "${LINUX_X86_64_SHA}"
-    end
-    on_arm do
-      url "${TAP_URL}/raygun-${VER}-linux-aarch64.tar.gz"
-      sha256 "${LINUX_AARCH64_SHA}"
-    end
-  end
-
-  def install
-    bin.install "raygun"
-  end
-
-  test do
-    assert_match "raygun", shell_output("#{bin}/raygun --version")
-  end
-end
-EOF
+          cat <<EOF | sed 's/^          //' > "${FORMULA_PATH}"
+          # Additional binaries available for direct download:
+          # - Linux ARMv7 (32-bit ARM): raygun-${VER}-linux-armv7.tar.gz
+          # - Linux x86_64 musl (Alpine/static): raygun-${VER}-linux-x86_64-musl.tar.gz
+          # - Linux ARM64 musl (Alpine/static): raygun-${VER}-linux-aarch64-musl.tar.gz
+          # Download from: ${TAP_URL}/
+          
+          class Raygun < Formula
+            desc "Raygun CLI"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            license :cannot_represent
+          
+            on_macos do
+              on_arm do
+                url "${TAP_URL}/raygun-${VER}-darwin-arm64.tar.gz"
+                sha256 "${DARWIN_SHA}"
+              end
+            end
+          
+            on_linux do
+              on_intel do
+                url "${TAP_URL}/raygun-${VER}-linux-x86_64.tar.gz"
+                sha256 "${LINUX_X86_64_SHA}"
+              end
+              on_arm do
+                url "${TAP_URL}/raygun-${VER}-linux-aarch64.tar.gz"
+                sha256 "${LINUX_AARCH64_SHA}"
+              end
+            end
+          
+            def install
+              bin.install "raygun"
+            end
+          
+            test do
+              assert_match "raygun", shell_output("#{bin}/raygun --version")
+            end
+          end
+          EOF
 
       - name: Commit & push
         run: |
