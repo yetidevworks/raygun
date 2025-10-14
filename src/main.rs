@@ -16,6 +16,11 @@ async fn main() -> Result<()> {
     init_tracing()?;
 
     let config = config::Config::parse();
+    if config.show_version {
+        println!("raygun {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let app = app::RaygunApp::bootstrap(config).await?;
     app.run().await
 }

@@ -4,6 +4,10 @@ use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
 pub struct Config {
+    /// Print the current Raygun version and exit.
+    #[arg(short = 'v', long = "version", help = "Print Raygun version and exit")]
+    pub show_version: bool,
+
     /// Address Raygun listens on for Ray payloads.
     #[arg(
         long = "bind",
