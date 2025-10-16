@@ -134,6 +134,10 @@ jobs:
     env:
       FORMULA_PATH: Formula/raygun.rb
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download artifacts (archives)
         uses: actions/download-artifact@v4
         with:
@@ -163,18 +167,34 @@ jobs:
           f=$(find /tmp/artifacts -name '*linux-aarch64-musl.tar.gz' -print -quit)
           [[ -f "$f" ]] && echo "linux_aarch64_musl_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
-      - name: Parse version from tag
-        id: v
+      - name: Read version from Cargo.toml
+        id: cargo
         run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "raygun") | .version')"
+          if [[ -z "${VERSION}" ]]; then
+            echo "Failed to parse version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
           RAW_TAG="${GITHUB_REF_NAME}"
-          echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+          TAG_VERSION="${RAW_TAG#v}"
+          CARGO_VERSION='${{ steps.cargo.outputs.version }}'
+          if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "Tag version (${TAG_VERSION}) does not match Cargo version (${CARGO_VERSION})." >&2
+            exit 1
+          fi
 
       - name: Write formula
         env:
           GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          VER='${{ steps.v.outputs.version }}'
+          VER='${{ steps.cargo.outputs.version }}'
           TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
           DARWIN_SHA='${{ steps.shas.outputs.darwin_arm64_sha }}'
           LINUX_X86_64_SHA='${{ steps.shas.outputs.linux_x86_64_sha }}'
@@ -201,6 +221,7 @@ jobs:
             desc "Raygun CLI"
             homepage "https://github.com/${GITHUB_REPOSITORY}"
             license :cannot_represent
+            version "${VER}"
 
             on_macos do
               on_arm do
