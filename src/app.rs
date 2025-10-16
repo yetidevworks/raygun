@@ -543,123 +543,203 @@ impl RaygunApp {
         };
 
         if let Some(overlay) = layout.overlay {
-            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                let area = match overlay {
-                    OverlayArea::Help(area) | OverlayArea::Debug(area) => area,
-                };
-                if point_in_rect(area) {
-                    match overlay {
-                        OverlayArea::Help(_) => {
+            match overlay {
+                OverlayArea::Help(area) => {
+                    if point_in_rect(area) {
+                        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                             self.show_help = false;
                         }
-                        OverlayArea::Debug(_) => {
-                            self.show_debug = false;
-                            self.debug_scroll = 0;
+                    }
+                }
+                OverlayArea::Debug(area) => {
+                    if point_in_rect(area) {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                self.show_debug = false;
+                                self.debug_scroll = 0;
+                            }
+                            MouseEventKind::ScrollUp => {
+                                self.debug_scroll = self.debug_scroll.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.debug_scroll = self.debug_scroll.saturating_add(1);
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
-            return false;
-        }
-
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
 
         if point_in_rect(layout.timeline_inner) && timeline_len > 0 {
-            let inner = layout.timeline_inner;
-            let relative_row = mouse.row.saturating_sub(inner.y) as usize;
-            if relative_row < inner.height as usize {
-                let view_height = inner.height as usize;
-                let selected = self.selected.unwrap_or(0);
-                let total = timeline_len;
-                let max_start = total.saturating_sub(view_height);
-                let start = selected
-                    .saturating_sub(view_height.saturating_sub(1))
-                    .min(max_start);
-                let target = start + relative_row;
-                if target < total {
-                    self.store_detail_state(detail_ctx.visible_len());
-                    self.focus = Focus::Timeline;
-                    self.selected = Some(target);
-                    if let Some(state) = self.current_detail_state() {
-                        self.detail_scroll = state.scroll;
-                    } else {
-                        self.detail_scroll = 0;
-                    }
-                }
-            }
-            return false;
-        }
-
-        if point_in_rect(layout.detail_inner) {
-            let detail = match detail_ctx.detail {
-                Some(detail) => detail,
-                None => return false,
-            };
-
-            if detail_ctx.visible_len() == 0 {
-                return false;
-            }
-
-            let inner = layout.detail_inner;
-            let relative_row = mouse.row.saturating_sub(inner.y) as usize;
-            if relative_row >= inner.height as usize {
-                return false;
-            }
-
-            let line_index = self.detail_scroll.saturating_add(relative_row);
-
-            let mut header_offset = 0;
-            if !detail.header.is_empty() {
-                header_offset = 2; // header + blank spacer
-            }
-
-            if line_index < header_offset {
-                self.focus = Focus::Detail;
-                return false;
-            }
-
-            let detail_position = line_index - header_offset;
-            if detail_position >= detail_ctx.visible_len() {
-                self.focus = Focus::Detail;
-                return false;
-            }
-
-            let max = detail_ctx.visible_len().saturating_sub(1);
-            let new_cursor = detail_position.min(max);
-            let new_scroll = self.detail_scroll.min(max);
-            if let Some(state) = self.current_detail_state_mut() {
-                state.cursor = new_cursor;
-                state.scroll = new_scroll;
-            }
-
-            self.detail_scroll = new_scroll;
-
-            self.focus = Focus::Detail;
-
-            let line_index_actual = detail_ctx.visible_indices[detail_position];
-            let has_children = detail_ctx
-                .has_children
-                .get(line_index_actual)
-                .copied()
-                .unwrap_or(false);
-
-            if has_children {
-                let detail_line = &detail.lines[line_index_actual];
-                let indent_width = detail_line.indent.saturating_mul(2) as usize;
-                let icon_width = 2usize;
-                let relative_col = mouse.column.saturating_sub(inner.x) as usize;
-
-                if relative_col < indent_width + icon_width {
-                    if self.toggle_current_node(detail_ctx) {
-                        self.store_detail_state(detail_ctx.visible_len());
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let inner = layout.timeline_inner;
+                    let relative_row = mouse.row.saturating_sub(inner.y) as usize;
+                    if relative_row < inner.height as usize {
+                        let view_height = inner.height as usize;
+                        let selected = self.selected.unwrap_or(0);
+                        let total = timeline_len;
+                        let max_start = total.saturating_sub(view_height);
+                        let start = selected
+                            .saturating_sub(view_height.saturating_sub(1))
+                            .min(max_start);
+                        let target = start + relative_row;
+                        if target < total {
+                            self.store_detail_state(detail_ctx.visible_len());
+                            self.focus = Focus::Timeline;
+                            self.selected = Some(target);
+                            if let Some(state) = self.current_detail_state() {
+                                self.detail_scroll = state.scroll;
+                            } else {
+                                self.detail_scroll = 0;
+                            }
+                        }
                     }
                     return false;
                 }
+                MouseEventKind::ScrollUp => {
+                    self.store_detail_state(detail_ctx.visible_len());
+                    self.focus = Focus::Timeline;
+                    if self.move_selection(-1, timeline_len).is_some() {
+                        if let Some(state) = self.current_detail_state() {
+                            self.detail_scroll = state.scroll;
+                        } else {
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    return false;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.store_detail_state(detail_ctx.visible_len());
+                    self.focus = Focus::Timeline;
+                    if self.move_selection(1, timeline_len).is_some() {
+                        if let Some(state) = self.current_detail_state() {
+                            self.detail_scroll = state.scroll;
+                        } else {
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    return false;
+                }
+                _ => {
+                    return false;
+                }
             }
+        }
 
-            return false;
+        if point_in_rect(layout.detail_inner) {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let detail = match detail_ctx.detail {
+                        Some(detail) => detail,
+                        None => return false,
+                    };
+
+                    if detail_ctx.visible_len() == 0 {
+                        return false;
+                    }
+
+                    let inner = layout.detail_inner;
+                    let relative_row = mouse.row.saturating_sub(inner.y) as usize;
+                    if relative_row >= inner.height as usize {
+                        return false;
+                    }
+
+                    let line_index = self.detail_scroll.saturating_add(relative_row);
+
+                    let mut header_offset = 0;
+                    if !detail.header.is_empty() {
+                        header_offset = 2; // header + blank spacer
+                    }
+
+                    if line_index < header_offset {
+                        self.focus = Focus::Detail;
+                        return false;
+                    }
+
+                    let detail_position = line_index - header_offset;
+                    if detail_position >= detail_ctx.visible_len() {
+                        self.focus = Focus::Detail;
+                        return false;
+                    }
+
+                    let max = detail_ctx.visible_len().saturating_sub(1);
+                    let new_cursor = detail_position.min(max);
+                    let new_scroll = self.detail_scroll.min(max);
+                    if let Some(state) = self.current_detail_state_mut() {
+                        state.cursor = new_cursor;
+                        state.scroll = new_scroll;
+                    }
+
+                    self.detail_scroll = new_scroll;
+
+                    self.focus = Focus::Detail;
+
+                    let line_index_actual = detail_ctx.visible_indices[detail_position];
+                    let has_children = detail_ctx
+                        .has_children
+                        .get(line_index_actual)
+                        .copied()
+                        .unwrap_or(false);
+
+                    if has_children {
+                        let detail_line = &detail.lines[line_index_actual];
+                        let indent_width = detail_line.indent.saturating_mul(2) as usize;
+                        let icon_width = 2usize;
+                        let relative_col = mouse.column.saturating_sub(inner.x) as usize;
+
+                        if relative_col < indent_width + icon_width {
+                            if self.toggle_current_node(detail_ctx) {
+                                self.store_detail_state(detail_ctx.visible_len());
+                            }
+                            return false;
+                        }
+                    }
+
+                    return false;
+                }
+                MouseEventKind::ScrollUp => {
+                    if detail_ctx.visible_len() == 0 {
+                        return false;
+                    }
+                    self.focus = Focus::Detail;
+                    if self.detail_scroll > 0 {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                        let updated_scroll = self.detail_scroll;
+                        let max = detail_ctx.visible_len().saturating_sub(1);
+                        if let Some(state) = self.current_detail_state_mut() {
+                            state.scroll = updated_scroll.min(max);
+                            state.cursor = state.cursor.min(max);
+                        }
+                    }
+                    return false;
+                }
+                MouseEventKind::ScrollDown => {
+                    if detail_ctx.visible_len() == 0 {
+                        return false;
+                    }
+                    let max_scroll = detail_ctx.visible_len().saturating_sub(1);
+                    if max_scroll == 0 {
+                        self.focus = Focus::Detail;
+                        return false;
+                    }
+                    let new_scroll = (self.detail_scroll.saturating_add(1)).min(max_scroll);
+                    if new_scroll != self.detail_scroll {
+                        self.detail_scroll = new_scroll;
+                        if let Some(state) = self.current_detail_state_mut() {
+                            state.scroll = new_scroll;
+                            state.cursor = state.cursor.min(max_scroll);
+                        }
+                    }
+                    self.focus = Focus::Detail;
+                    return false;
+                }
+                _ => {
+                    return false;
+                }
+            }
         }
 
         false

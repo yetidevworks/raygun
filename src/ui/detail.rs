@@ -62,6 +62,7 @@ pub fn build_detail_view(payload: &Payload, received_at: SystemTime) -> DetailVi
         PayloadKind::Custom => render_custom(payload),
         PayloadKind::Label => render_label(payload),
         PayloadKind::Trace => render_trace(payload),
+        PayloadKind::Exception => render_exception(payload),
         PayloadKind::Measure => render_measure(payload),
         PayloadKind::Caller => render_caller(payload),
         PayloadKind::DecodedJson | PayloadKind::JsonString => render_json(payload),
@@ -391,7 +392,7 @@ fn render_trace(payload: &Payload) -> Vec<DetailLine> {
 
     for (index, frame) in frames.iter().enumerate() {
         if let Some(frame) = frame.as_object() {
-            push_frame_lines(index, frame, &mut lines);
+            push_frame_lines(index, frame, 0, &mut lines);
             lines.push(parse_plain_line(""));
         }
     }
@@ -400,6 +401,145 @@ fn render_trace(payload: &Payload) -> Vec<DetailLine> {
         if last.segments.len() == 1 && last.segments[0].text.is_empty() {
             // remove trailing blank line
             lines.pop();
+        }
+    }
+
+    lines
+}
+
+fn render_exception(payload: &Payload) -> Vec<DetailLine> {
+    let content = match payload.content_object() {
+        Some(content) => content,
+        None => return fallback_lines(payload),
+    };
+
+    let class = content
+        .get("class")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Exception");
+
+    let mut lines = Vec::new();
+    lines.push(DetailLine {
+        indent: 0,
+        segments: vec![
+            DetailSegment {
+                text: "Exception".to_string(),
+                style: SegmentStyle::Key,
+            },
+            DetailSegment {
+                text: ": ".to_string(),
+                style: SegmentStyle::Plain,
+            },
+            DetailSegment {
+                text: class.to_string(),
+                style: SegmentStyle::Type,
+            },
+        ],
+    });
+
+    if let Some(message) = content.get("message") {
+        push_value_lines(&mut lines, 1, "message", message);
+    } else {
+        lines.push(DetailLine {
+            indent: 1,
+            segments: vec![
+                DetailSegment {
+                    text: "message: ".to_string(),
+                    style: SegmentStyle::Key,
+                },
+                DetailSegment {
+                    text: "(missing)".to_string(),
+                    style: SegmentStyle::Plain,
+                },
+            ],
+        });
+    }
+
+    if let Some(frames) = content.get("frames").and_then(|value| value.as_array()) {
+        if let Some(first_frame) = frames.first().and_then(|value| value.as_object()) {
+            let file = first_frame
+                .get("file_name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let line_number = first_frame
+                .get("line_number")
+                .and_then(|value| value.as_i64());
+
+            if file.is_some() || line_number.is_some() {
+                let mut segments = Vec::new();
+                segments.push(DetailSegment {
+                    text: "location: ".to_string(),
+                    style: SegmentStyle::Key,
+                });
+
+                if let Some(file) = file {
+                    segments.push(DetailSegment {
+                        text: file.to_string(),
+                        style: SegmentStyle::String,
+                    });
+                } else {
+                    segments.push(DetailSegment {
+                        text: "(unknown)".to_string(),
+                        style: SegmentStyle::Null,
+                    });
+                }
+
+                if let Some(line_number) = line_number {
+                    if file.is_some() {
+                        segments.push(DetailSegment {
+                            text: ":".to_string(),
+                            style: SegmentStyle::Plain,
+                        });
+                    }
+                    segments.push(DetailSegment {
+                        text: line_number.to_string(),
+                        style: SegmentStyle::Number,
+                    });
+                }
+
+                lines.push(DetailLine {
+                    indent: 1,
+                    segments,
+                });
+            }
+        }
+
+        if !frames.is_empty() {
+            lines.push(DetailLine {
+                indent: 1,
+                segments: vec![DetailSegment {
+                    text: format!("stack trace ({} frames)", frames.len()),
+                    style: SegmentStyle::Key,
+                }],
+            });
+
+            let frame_count = frames.len();
+            for (index, frame) in frames.iter().enumerate() {
+                if let Some(frame) = frame.as_object() {
+                    push_frame_lines(index, frame, 2, &mut lines);
+                    if index + 1 < frame_count {
+                        lines.push(empty_line(2));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(meta) = content.get("meta") {
+        if !meta.is_null() {
+            if !(matches!(meta, Value::Array(items) if items.is_empty())) {
+                push_value_lines(&mut lines, 1, "meta", meta);
+            }
+        }
+    }
+
+    for (key, value) in content {
+        match key.as_str() {
+            "class" | "message" | "frames" | "meta" => continue,
+            other_key => {
+                push_value_lines(&mut lines, 1, other_key, value);
+            }
         }
     }
 
@@ -424,7 +564,7 @@ fn render_caller(payload: &Payload) -> Vec<DetailLine> {
         .and_then(|value| value.as_object());
 
     if let Some(frame) = frame {
-        push_frame_lines(0, frame, &mut lines);
+        push_frame_lines(0, frame, 0, &mut lines);
     } else {
         return fallback_lines(payload);
     }
@@ -432,7 +572,12 @@ fn render_caller(payload: &Payload) -> Vec<DetailLine> {
     lines
 }
 
-fn push_frame_lines(index: usize, frame: &Map<String, Value>, lines: &mut Vec<DetailLine>) {
+fn push_frame_lines(
+    index: usize,
+    frame: &Map<String, Value>,
+    base_indent: usize,
+    lines: &mut Vec<DetailLine>,
+) {
     let class = frame
         .get("class")
         .and_then(|value| value.as_str())
@@ -485,7 +630,7 @@ fn push_frame_lines(index: usize, frame: &Map<String, Value>, lines: &mut Vec<De
         });
     }
     lines.push(DetailLine {
-        indent: 0,
+        indent: base_indent,
         segments: header_segments,
     });
 
@@ -506,9 +651,154 @@ fn push_frame_lines(index: usize, frame: &Map<String, Value>, lines: &mut Vec<De
             });
         }
         lines.push(DetailLine {
-            indent: 1,
+            indent: base_indent + 1,
             segments: location_segments,
         });
+    }
+}
+
+fn push_value_lines(lines: &mut Vec<DetailLine>, indent: usize, label: &str, value: &Value) {
+    match value {
+        Value::String(text) => {
+            if text.is_empty() {
+                lines.push(DetailLine {
+                    indent,
+                    segments: vec![
+                        DetailSegment {
+                            text: format!("{}: ", label),
+                            style: SegmentStyle::Key,
+                        },
+                        DetailSegment {
+                            text: "\"\"".to_string(),
+                            style: SegmentStyle::String,
+                        },
+                    ],
+                });
+                return;
+            }
+
+            let mut pieces = text.lines();
+            if let Some(first) = pieces.next() {
+                lines.push(DetailLine {
+                    indent,
+                    segments: vec![
+                        DetailSegment {
+                            text: format!("{}: ", label),
+                            style: SegmentStyle::Key,
+                        },
+                        DetailSegment {
+                            text: first.to_string(),
+                            style: SegmentStyle::String,
+                        },
+                    ],
+                });
+            }
+
+            for extra in pieces {
+                if extra.is_empty() {
+                    lines.push(empty_line(indent + 1));
+                } else {
+                    lines.push(DetailLine {
+                        indent: indent + 1,
+                        segments: vec![DetailSegment {
+                            text: extra.to_string(),
+                            style: SegmentStyle::String,
+                        }],
+                    });
+                }
+            }
+        }
+        Value::Number(number) => {
+            lines.push(DetailLine {
+                indent,
+                segments: vec![
+                    DetailSegment {
+                        text: format!("{}: ", label),
+                        style: SegmentStyle::Key,
+                    },
+                    DetailSegment {
+                        text: number.to_string(),
+                        style: SegmentStyle::Number,
+                    },
+                ],
+            });
+        }
+        Value::Bool(boolean) => {
+            lines.push(DetailLine {
+                indent,
+                segments: vec![
+                    DetailSegment {
+                        text: format!("{}: ", label),
+                        style: SegmentStyle::Key,
+                    },
+                    DetailSegment {
+                        text: boolean.to_string(),
+                        style: SegmentStyle::Boolean,
+                    },
+                ],
+            });
+        }
+        Value::Null => {
+            lines.push(DetailLine {
+                indent,
+                segments: vec![
+                    DetailSegment {
+                        text: format!("{}: ", label),
+                        style: SegmentStyle::Key,
+                    },
+                    DetailSegment {
+                        text: "null".to_string(),
+                        style: SegmentStyle::Null,
+                    },
+                ],
+            });
+        }
+        other => {
+            let json = serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string());
+            let mut first_line = true;
+            for line in json.lines() {
+                let trimmed = line.trim();
+                let indent_width = line.chars().take_while(|ch| ch.is_whitespace()).count();
+                let extra_indent = indent_width / 2;
+
+                if first_line {
+                    lines.push(DetailLine {
+                        indent,
+                        segments: vec![
+                            DetailSegment {
+                                text: format!("{}: ", label),
+                                style: SegmentStyle::Key,
+                            },
+                            DetailSegment {
+                                text: trimmed.to_string(),
+                                style: SegmentStyle::Plain,
+                            },
+                        ],
+                    });
+                    first_line = false;
+                } else if trimmed.is_empty() {
+                    lines.push(empty_line(indent + 1 + extra_indent));
+                } else {
+                    lines.push(DetailLine {
+                        indent: indent + 1 + extra_indent,
+                        segments: vec![DetailSegment {
+                            text: trimmed.to_string(),
+                            style: SegmentStyle::Plain,
+                        }],
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn empty_line(indent: usize) -> DetailLine {
+    DetailLine {
+        indent,
+        segments: vec![DetailSegment {
+            text: String::new(),
+            style: SegmentStyle::Plain,
+        }],
     }
 }
 

@@ -58,6 +58,7 @@ list below shows the formatting that is currently implemented:
 | Count | `ray('Counting users')->count('users')` | Timeline merges the log and count payload; detail shows the count message |
 | Trace | `ray('Backtrace')->backtrace()` | Single `[trace]` entry with styled stack frames (class, method, file:line) |
 | Caller | `ray('Caller')->caller()` | Single `[caller]` entry showing the originating frame |
+| Exception | `ray()->exception($e)` | Dump specific exception in a readable format |
 | Measure | `ray()->measure('DB query start'); ray()->measure('DB query end');` | Structured key/value summary (total time, delta, memory usage) |
 | PHP info | `ray()->phpinfo()` | Key/value list highlighting version, ini paths, limits, and full extension list |
 | JSON | `ray()->json(json_encode($data, JSON_PRETTY_PRINT))->label('JSON payload')` | Symfony SfDump wrappers are stripped; structured JSON tree rendered like native Ray |
